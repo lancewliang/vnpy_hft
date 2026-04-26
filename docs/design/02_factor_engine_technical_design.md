@@ -6,9 +6,9 @@
 
 - 消费 `md.tick.raw.<product_id>` 原始行情事件
 - 维护因子侧 `factor_time_interval` 区间
-- 基于最近 `5` 分钟原始行情缓存计算实时因子
+- 基于“当前未闭合区间原始行情缓存 + 因子缓存”计算实时因子
 - 重启启动时从数据库加载最近 `raw_market_cache_seconds` 原始行情和最近 `400` 行因子到服务内存缓存
-- 非重启连续运行时通过消费 topic 流持续保留原始行情缓存与因子缓存
+- 非重启连续运行时通过消费 topic 流持续保留因子缓存，原始行情缓存仅保留未闭合区间所需数据
 - 对外发布 `md.tick.merged.<product_id>`（合并后的原始行）供归档服务落库
 - 对外发布 `factor.unit.calculated.<product_id>` 供归档服务落库
 - 通过进程内调用直接触发策略模块计算
@@ -29,7 +29,7 @@
 
 - 消费 `md.tick.raw.<product_id>`
 - 将原始 tick 转换为因子计算所需的内部结构
-- 维护目标长度为 `5` 分钟的原始行情窗口
+- 维护“当前未闭合区间”的原始行情缓存
 - 维护 `factor_time_interval` 区间闭合
 - 基于“原始行情缓存 + 因子缓存”执行增量流式计算
 - 计算因子并更新最近 `400` 行因子内存缓存
@@ -148,19 +148,19 @@ flowchart LR
 
 职责：
 
-- 为每个 `instrument_id` 维护最近 `5` 分钟原始行情窗口
+- 为每个 `instrument_id` 维护“当前未闭合区间”原始行情缓存
 - 为每个 `instrument_id` 维护 `factor_time_interval` 区间状态
 - 为每条原始行情维护 `factor_calculated` 状态
 - 在时间区间闭合时产生 `FactorWindowContext`
 
 窗口规则：
 
-- 原始窗口目标长度：`raw_market_cache_seconds = 300`（`5` 分钟）
+- `raw_market_cache_seconds = 300` 仅用于“重启恢复回看窗口”，不是运行期保留目标
 - 时间分块按分钟锚点对齐：例如 `factor_time_interval=20s` 时为每分钟 `00/20/40/60` 秒闭合，`30s` 时为 `00/30/60`
 - 约束：`factor_time_interval_seconds` 必须整除 `60`，确保分钟内闭合边界一致
 - 时间区间按 `factor_time_interval` 左闭右开：`[unit_start_ts, unit_end_ts)`
 - 闭合由因子模块自身触发，不依赖行情服务发送窗口事件
-- 缓存淘汰仅允许删除“超出目标窗口且 `factor_calculated=true`”的数据
+- 闭合区间完成预聚合后，必须对该区间原始行情执行“整窗淘汰”
 - `FactorWindowContext` 必须包含该区间内全部原始数据行（行数不固定）
 
 ### 6.4 Factor PreCalculator
@@ -207,20 +207,20 @@ flowchart LR
 缓存规则：
 
 - 缓存粒度：`instrument_id`
-- 原始行情缓存：目标为最近 `5` 分钟（`raw_market_cache_seconds=300`）
+- 原始行情缓存：运行期只保留未闭合区间数据
 - 缓存容量：最近 `400` 行
 - 缓存介质：仅进程内内存，不使用 Redis
 - 因子缓存顺序：按 `unit_end_ts` 升序维护，队尾永远是最新因子行
 - 因子缓存淘汰：当行数超过 `factor_cache_rows(=400)` 时，淘汰队首最旧行
 - 原始行情缓存状态：`factor_calculated`（默认 `false`，当对应区间因子计算完成后置为 `true`）
-- 原始行情淘汰规则：仅当数据超出 `raw_market_cache_seconds` 且 `factor_calculated=true` 时允许淘汰
+- 原始行情淘汰规则：仅允许淘汰 `factor_calculated=true` 的数据，且按已闭合区间整窗淘汰
 - 未计算数据保护：`factor_calculated=false` 的原始数据禁止淘汰，直到参与因子计算完成
-- 说明：当未计算数据积压时，实际原始行情缓存长度允许临时超过 `raw_market_cache_seconds`
+- 一致性约束：运行期不应存在“已闭合区间但仍滞留缓存”的原始行情数据
 - 缓存来源：
-- 重启：原始行情缓存与因子缓存均从 PostgreSQL 加载
-- 非重启：原始行情缓存由 `md.tick.raw.<product_id>` 消费流持续保留，因子缓存由消费流驱动的在线计算结果持续保留
+- 重启：原始行情缓存（回看 `raw_market_cache_seconds`）与因子缓存均从 PostgreSQL 加载
+- 非重启：原始行情缓存由 `md.tick.raw.<product_id>` 实时构建当前未闭合区间，因子缓存由在线计算结果持续保留
 - 合约切换：当 `contract.plan.generated.<product_id>` 生效且合约集合变化时，清空该 `product_id` 下所有 `instrument_id` 的原始行情缓存、因子缓存和窗口游标
-- 预热闸门：切换后暂停策略触发，直到新合约集合内每个 `instrument_id` 至少生成 `1` 行因子
+- 预热闸门：切换后暂停策略触发，直到新合约集合内每个 `instrument_id` 的因子缓存行数达到 `factor_cache_rows`
 
 ### 6.7 Strategy Bridge
 
@@ -272,7 +272,7 @@ flowchart LR
 
 - 切换判定键：`product_id + effective_trading_day + cutover_time`
 - 清空范围：该 `product_id` 下全部 `instrument_id` 的原始行情缓存、因子缓存、窗口游标
-- 预热完成：新集合中每个 `instrument_id` 至少完成 `1` 个 `factor_time_interval` 并生成首行因子
+- 预热完成：新集合中每个 `instrument_id` 的因子缓存行数达到 `factor_cache_rows`
 - 说明：合约切换时执行强制全量清空，不受 `factor_calculated` 保护约束
 
 ### 6.11 FactorWindowContext 定义
@@ -282,26 +282,28 @@ flowchart LR
 - 向 `Factor PreCalculator` 提供本次预聚合输入
 - 作为后续 `FactorDecisionContext` 组装的时间窗口基准
 
-存储内容（建议字段）：
+字段定义（建议）：
 
-- `window_id`：窗口唯一标识，建议 `instrument_id + unit_end_ts + factor_time_interval`
-- `product_id`
-- `instrument_id`
-- `vt_symbol`
-- `trading_day`
-- `factor_time_interval`
-- `factor_time_interval_seconds`
-- `unit_start_ts`
-- `unit_end_ts`
-- `aggregation_semantic`：固定 `step4.aggregate_by_minute.v2`
-- `raw_market_cache_seconds_target`（固定 `300`）
-- `raw_rows_in_unit`：本窗口用于计算的全部原始数据行
-- `raw_rows_in_unit_count`
-- `last_tick_ts`
-- `raw_cache_total_rows`
-- `raw_cache_uncalculated_rows`
-- `raw_cache_evict_blocked_rows`
-- `close_reason`：默认 `interval_closed`
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `window_id` | `string` | 窗口唯一标识，建议 `instrument_id + unit_end_ts + factor_time_interval` |
+| `product_id` | `string` | 品种标识 |
+| `instrument_id` | `string` | 合约标识 |
+| `vt_symbol` | `string` | `instrument_id.exchange` |
+| `trading_day` | `date` | 交易日 |
+| `factor_time_interval` | `string` | 区间长度（如 `20s`） |
+| `factor_time_interval_seconds` | `int` | 区间秒数值 |
+| `unit_start_ts` | `timestamptz` | 区间起始时间 |
+| `unit_end_ts` | `timestamptz` | 区间结束时间 |
+| `aggregation_semantic` | `string` | 聚合语义版本，固定 `step4.aggregate_by_minute.v2` |
+| `raw_market_cache_seconds_target` | `int` | 启动恢复回看窗口秒数，固定 `300` |
+| `raw_rows_in_unit` | `list<object>` | 本窗口用于计算的全部原始数据行 |
+| `raw_rows_in_unit_count` | `int` | 本窗口原始数据行数 |
+| `last_tick_ts` | `timestamptz` | 本窗口最后一条原始行情时间 |
+| `raw_cache_total_rows` | `int` | 构建上下文瞬间的原始缓存总行数（可观测性） |
+| `raw_cache_uncalculated_rows` | `int` | 未计算原始行情行数（可观测性） |
+| `raw_cache_evict_blocked_rows` | `int` | 因未计算而被淘汰保护阻塞的行数（可观测性） |
+| `close_reason` | `string` | 窗口闭合原因，默认 `interval_closed` |
 
 说明：
 
@@ -309,7 +311,7 @@ flowchart LR
 - 示例：`factor_time_interval=20s` 时若区间内收到 `40` 行原始数据，则 `raw_rows_in_unit_count=40`
 - `raw_cache_*` 字段用于可观测性与调试，不参与因子数学计算
 - `FactorWindowContext` 本身不包含最终因子值；因子值由 `Factor Calculator` 在预聚合后计算产出
-- 窗口内原始行情在完成本窗口计算后，需要将对应记录标记为 `factor_calculated=true`
+- 窗口内原始行情在完成本窗口计算后，需标记 `factor_calculated=true` 并执行整窗淘汰
 
 示例：
 
@@ -340,32 +342,34 @@ flowchart LR
 
 `MergedRawUnitRow` 是 `Factor PreCalculator` 的输出，表示“该 `factor_time_interval` 区间合并后的原始数据”，是 `Factor Calculator` 的直接输入。
 
-建议字段：
+字段定义（建议）：
 
-- `window_id`
-- `product_id`
-- `instrument_id`
-- `trading_day`
-- `factor_time_interval`
-- `unit_start_ts`
-- `unit_end_ts`
-- `aggregation_semantic`
-- `precalc_rev`
-- `rev_ts`
-- `datetime`（窗口内最后一条快照时间）
-- `minute`（按 `factor_time_interval` 截断后的窗口键）
-- `is_consecutive_minute`
-- `open_price`
-- `high_price`
-- `low_price`
-- `close_price`
-- `total_trade_volume`
-- `turnover`
-- `open_interest`
-- `bid1_price..bid5_price`
-- `bid1_size..bid5_size`
-- `ask1_price..ask5_price`
-- `ask1_size..ask5_size`
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `window_id` | `string` | 关联 `FactorWindowContext.window_id` |
+| `product_id` | `string` | 品种标识 |
+| `instrument_id` | `string` | 合约标识 |
+| `trading_day` | `date` | 交易日 |
+| `factor_time_interval` | `string` | 聚合区间长度（如 `20s`） |
+| `unit_start_ts` | `timestamptz` | 区间起始时间 |
+| `unit_end_ts` | `timestamptz` | 区间结束时间 |
+| `aggregation_semantic` | `string` | 聚合语义版本 |
+| `precalc_rev` | `int` | 预聚合修订号 |
+| `rev_ts` | `timestamptz` | 合并事件接收/生成时间 |
+| `datetime` | `timestamptz` | 窗口内最后一条快照时间 |
+| `minute` | `timestamptz` | 按 `factor_time_interval` 截断后的窗口键 |
+| `is_consecutive_minute` | `smallint` | 连续窗口标记（0/1） |
+| `open_price` | `numeric(18,8)` | 区间首笔价格 |
+| `high_price` | `numeric(18,8)` | 区间最高价 |
+| `low_price` | `numeric(18,8)` | 区间最低价 |
+| `close_price` | `numeric(18,8)` | 区间末笔价格 |
+| `total_trade_volume` | `bigint` | 区间末笔累计成交量 |
+| `turnover` | `numeric(20,4)` | 区间末笔累计成交额 |
+| `open_interest` | `numeric(20,4)` | 区间末笔持仓量 |
+| `bid1_price..bid5_price` | `numeric(18,8)` | 买一到买五价格（末笔快照） |
+| `bid1_size..bid5_size` | `bigint` | 买一到买五数量（末笔快照） |
+| `ask1_price..ask5_price` | `numeric(18,8)` | 卖一到卖五价格（末笔快照） |
+| `ask1_size..ask5_size` | `bigint` | 卖一到卖五数量（末笔快照） |
 
 ## 7. 事件模型
 
@@ -448,8 +452,8 @@ sequenceDiagram
     MQ->>AS: consume md.tick.merged.*
     AS->>PG: idempotent write merged_tick_l2
     FE->>FE: Factor Calculator(use feature_calculator + product factor list)
-    FE->>FE: mark related raw ticks as factor_calculated=true
-    FE->>FE: evict only calculated raw ticks out of window
+    FE->>FE: mark closed-window raw ticks as factor_calculated=true
+    FE->>FE: evict all raw ticks in the closed window as a batch
     FE->>FE: update in-memory factor cache(last 400 rows)
     FE->>SE: invoke strategy in-process
     FE->>MQ: publish factor.unit.calculated.<product_id>
@@ -469,8 +473,8 @@ sequenceDiagram
 
 - 重启场景：读取最近一段 `md_tick_l2_rt` 数据（最近 `5` 分钟）重建原始窗口
 - 重启场景：读取最近 `factor_unit_rt` 的最近 `400` 行恢复因子缓存和窗口游标
-- 非重启场景：不回库，继续通过已消费 topic 流滚动维护原始行情缓存与因子缓存
-- 恢复期内暂不触发策略模块，直到原始行情缓存和因子缓存都完成对齐
+- 非重启场景：不回库，继续通过已消费 topic 流滚动维护因子缓存与未闭合区间原始缓存
+- 恢复期内暂不触发策略模块，直到因子缓存行数达到 `factor_cache_rows`
 
 ### 9.3 合约切换恢复
 
@@ -485,7 +489,7 @@ sequenceDiagram
 - 连续失败：触发 `system.alert`
 - 因子缓存加载不足 `400` 行：记录告警，但允许在冷启动阶段继续滚动补齐
 - 合约切换后长时间未完成预热：触发 `system.alert` 并阻断策略
-- 未计算原始行情持续堆积导致无法淘汰：触发 `system.alert` 并阻断策略
+- 已闭合区间原始行情未被整窗淘汰：触发 `system.alert` 并阻断策略
 
 ## 10. 部署规范
 
@@ -499,7 +503,7 @@ sequenceDiagram
 ### 10.2 单品种多合约
 
 - 一个决策流水线实例负责同一 `product_id` 的前4主力合约
-- 每个 `instrument_id` 独立维护 `raw_market_cache_seconds` 窗口与 `factor_time_interval` 区间
+- 每个 `instrument_id` 独立维护未闭合区间原始缓存与 `factor_time_interval` 区间
 - 每个 `instrument_id` 独立维护最近 `400` 行因子缓存
 - 适合作为生产环境默认模式
 
@@ -511,30 +515,31 @@ sequenceDiagram
 
 ## 11. 配置项
 
-- `factor_time_interval`
-- `raw_market_cache_minutes=5`
-- `raw_market_cache_seconds=300`
-- `factor_cache_rows=400`
-- `factor_set`
-- `factor_version`
-- `factor_precalc_semantic=step4.aggregate_by_minute.v2`
-- `factor_precalc_interval_parser=step4.interval_to_seconds`
-- `factor_calculator_module=MacroHFT_Features_SH.src.gen.feature_calculator`
-- `factor_feature_list_by_product`（按 `product_id` 配置因子列清单）
-- `factor_feature_list_by_product` 示例：`{"al":["wap_balance","price_spread"],"fu":["imbalance_top3","volatility_60"]}`
-- `factor_feature_list_strict=true`（配置项必须是 `get_feature_columns()` 子集）
-- `factor_raw_subject=md.tick.raw.{product_id}`
-- `factor_merged_subject=md.tick.merged.{product_id}`
-- `factor_archive_subject=factor.unit.calculated.{product_id}`
-- `contract_plan_subject=contract.plan.generated.{product_id}`
-- `factor_calc_retry_max`
-- `factor_publish_retry_max`
-- `factor_publish_timeout_ms`
-- `factor_recovery_lookback_seconds`
-- `factor_switch_reset_mode=full_flush`
-- `factor_warmup_min_units=1`
-- `raw_cache_evict_requires_calculated=true`
-- `strategy_inproc_enabled=true`
+| 配置项 | 默认值/示例 | 含义 | 备注 |
+| --- | --- | --- | --- |
+| `factor_time_interval` | `20s` / `30s` | 每行因子的时间区间长度 | 决定闭合频率与策略触发节奏 |
+| `raw_market_cache_seconds` | `300` | 启动恢复回看窗口（秒） | 已删除重复项 `raw_market_cache_minutes` |
+| `factor_cache_rows` | `400` | 因子缓存保留行数 | 超出后淘汰最旧行 |
+| `factor_set` | `default` | 因子集合名 | 便于多集合并行 |
+| `factor_version` | `v1` | 因子算法版本 | 用于回溯与灰度 |
+| `factor_feature_list_by_product` | `{"al":["wap_balance"],"fu":["imbalance_top3"]}` | 按 `product_id` 配置输出因子列 | 仅输出白名单列 |
+| `factor_feature_list_strict` | `true` | 是否严格校验因子列名 | `true` 时必须是 `get_feature_columns()` 子集 |
+| `factor_raw_subject_pattern` | `md.tick.raw.{product_id}` | 原始行情订阅主题模板 | `product_id` 分片 |
+| `factor_merged_subject_pattern` | `md.tick.merged.{product_id}` | 合并原始行发布主题模板 | 给归档服务落库 |
+| `factor_archive_subject_pattern` | `factor.unit.calculated.{product_id}` | 因子结果发布主题模板 | 给归档服务落库 |
+| `contract_plan_subject_pattern` | `contract.plan.generated.{product_id}` | 次交易日合约计划主题模板 | 触发切换与预热 |
+| `factor_calc_retry_max` | `3` | 单窗口因子计算最大重试次数 | 超过后告警 |
+| `factor_publish_retry_max` | `3` | 发布消息最大重试次数 | 同时适用于 merged/factor 发布 |
+| `factor_publish_timeout_ms` | `200` | 单次发布超时阈值 | 超时计入重试 |
+| `factor_recovery_lookback_seconds` | `300` | 启动恢复回看窗口（秒） | 通常与原始缓存窗口一致 |
+| `factor_switch_reset_mode` | `full_flush` | 合约切换时缓存重置策略 | 当前仅支持全量清空 |
+| `raw_cache_evict_requires_calculated` | `true` | 原始行情淘汰前必须已参与计算 | 闭合区间计算完成后执行整窗淘汰 |
+
+说明：
+
+- `factor_precalc_semantic`、`factor_precalc_interval_parser`、`factor_calculator_module` 属于实现基线，不再作为运行时配置项。
+- `strategy_inproc_enabled` 与策略侧 `strategy_trigger_mode=inprocess` 功能重复，统一保留后者。
+- `factor_warmup_min_units` 与 `factor_cache_rows` 目标重复，已删除；预热阈值统一复用 `factor_cache_rows`。
 
 ## 12. 可观测性与告警
 
@@ -570,8 +575,8 @@ sequenceDiagram
 - `Factor Calculator` 与 `feature_calculator.calculate_all_features()` 的列值一致性
 - 按 `product_id` 的因子列表裁剪正确性（仅输出配置列）
 - 启动时因子列表配置校验正确性（非法列触发 fail-fast）
-- 原始行情缓存 `5` 分钟目标与超窗保护边界正确性
-- 原始行情 `factor_calculated` 状态流转与淘汰条件正确性
+- 原始行情按闭合区间整窗淘汰的边界正确性
+- 原始行情 `factor_calculated` 状态流转与整窗淘汰条件正确性
 - 未计算原始行情不得被淘汰
 - 最近 `400` 行因子缓存装载与滚动淘汰
 - 合约集合切换时全量缓存清空与窗口游标重置正确性
@@ -584,7 +589,7 @@ sequenceDiagram
 - `MergedRawUnitRow -> factor row` 在线计算结果与 `feature_calculator` 一致
 - 启动时同时恢复原始行情缓存与因子缓存
 - 非重启连续运行时缓存来自消费 topic 流且不中断
-- 原始行情缓存仅淘汰 `factor_calculated=true` 且超窗数据
+- 原始行情缓存在闭合窗口计算后执行整窗淘汰
 - 合约集合切换后全量清缓存并进入预热
 - 归档服务对 `merged_tick_l2_rt` 的幂等写入
 - 归档服务对 `factor_unit_rt` 的幂等写入
@@ -598,13 +603,13 @@ sequenceDiagram
 - `factor_time_interval` 闭合到因子结果发布 `p99 <= 200ms`
 - 合并后原始数据（`MergedRawUnitRow`）字段口径与 `aggregate_by_minute()` 一致
 - 因子列口径与 `feature_calculator` 一致，且仅包含该 `product_id` 配置的因子列表
-- 重启后最近 `5` 分钟原始行情缓存与最近 `400` 行因子缓存完整、无明显窗口错位与重复写入
+- 重启后最近 `5` 分钟回看窗口与最近 `400` 行因子缓存恢复完整、无明显窗口错位与重复写入
 - 合约切换后仅当预热完成才恢复策略触发，且不出现跨合约缓存污染
 
 ## 14. 实施计划（建议）
 
 1. 第一阶段：窗口骨架
-- 完成原始 tick 消费、`5` 分钟原始窗口与 `factor_time_interval` 闭合
+- 完成原始 tick 消费、未闭合区间原始缓存与 `factor_time_interval` 闭合
 
 2. 第二阶段：PreCalculator 落地
 - 基于 `interval_to_seconds()` + `aggregate_by_minute()` 完成在线预聚合（输出 `MergedRawUnitRow`）

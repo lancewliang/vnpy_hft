@@ -196,6 +196,7 @@ flowchart LR
 ### 7.5 合约切换闸门
 
 - 当 `product_id` 的合约集合发生切换时，策略模块必须等待因子模块预热完成
+- 预热完成判定：新合约集合内每个 `instrument_id` 的因子缓存行数达到 `factor_cache_rows`
 - 预热完成前不发布任何 `strategy.signal`
 - 预热完成后按新 `instrument_id` 集合恢复周期触发
 
@@ -285,16 +286,21 @@ sequenceDiagram
 
 ## 12. 配置项
 
-- `factor_time_interval`
-- `strategy_trigger_mode=inprocess`
-- `signal_ttl_ms`
-- `market_freshness_threshold_ms`
-- `position_freshness_threshold_ms`
-- `strategy_query_api_endpoint`
-- `strategy_id`
-- `strategy_version`
-- `max_cycle_retry`
-- `strategy_wait_factor_warmup=true`
+| 配置项 | 默认值/示例 | 含义 |
+| --- | --- | --- |
+| `strategy_trigger_mode` | `inprocess` | 策略触发模式，固定为因子模块进程内回调 |
+| `signal_ttl_ms` | `500` | 信号有效期（毫秒），过期后禁止下发 |
+| `market_freshness_threshold_ms` | `1000` | 行情新鲜度阈值（毫秒） |
+| `position_freshness_threshold_ms` | `1000` | 持仓新鲜度阈值（毫秒） |
+| `strategy_query_api_endpoint` | `http://...` | 持仓/活动委托状态查询接口地址 |
+| `strategy_id` | `archetype_v1` | 策略标识 |
+| `strategy_version` | `v1` | 策略版本 |
+| `max_cycle_retry` | `3` | 单周期最大重试次数 |
+| `strategy_wait_factor_warmup` | `true` | 是否等待因子预热完成后再触发策略 |
+
+说明：
+
+- `factor_time_interval` 由因子服务统一配置并随回调上下文传入，策略服务不再重复配置。
 
 ## 13. 可观测性与告警
 

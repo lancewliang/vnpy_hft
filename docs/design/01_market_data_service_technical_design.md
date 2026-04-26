@@ -293,19 +293,21 @@ sequenceDiagram
 
 ## 11. 配置项
 
-- `gateway_name=CTP`
-- `ctp_setting.*`
-- `publish_subject_pattern=md.tick.raw.{product_id}`
-- `publish_retry_max`
-- `publish_retry_backoff_ms`
-- `publisher_buffer_size`
-- `reconnect_backoff_ms`
-- `heartbeat_interval_sec`
-- `subscription_plan_source`
-- `subscription_plan_subject_pattern=contract.plan.generated.{product_id}`
-- `subscription_effective_field=effective_trading_day`
-- `subscription_cutover_field=cutover_time`
-- `subscription_top_n_default=4`
+| 配置项 | 默认值/示例 | 含义 |
+| --- | --- | --- |
+| `gateway_name` | `CTP` | 交易网关类型 |
+| `ctp_setting.*` | `brokerid/userid/...` | CTP 连接参数 |
+| `publish_subject_pattern` | `md.tick.raw.{product_id}` | 原始行情发布主题模板 |
+| `publish_retry_max` | `3` | 单条发布最大重试次数 |
+| `publish_retry_backoff_ms` | `50` | 发布失败重试退避时间 |
+| `publisher_buffer_size` | `10000` | 发布缓冲区容量 |
+| `reconnect_backoff_ms` | `1000` | 网关断线重连退避时间 |
+| `heartbeat_interval_sec` | `10` | 网关心跳间隔（秒） |
+| `subscription_plan_source` | `db` / `topic` | 次交易日订阅计划读取来源 |
+| `subscription_plan_subject_pattern` | `contract.plan.generated.{product_id}` | 订阅计划主题模板 |
+| `subscription_effective_field` | `effective_trading_day` | 订阅计划生效日期字段名 |
+| `subscription_cutover_field` | `cutover_time` | 订阅计划切换时间字段名 |
+| `subscription_top_n_default` | `4` | 默认每品种订阅合约数 |
 
 ## 12. 可观测性与告警
 

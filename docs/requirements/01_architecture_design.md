@@ -52,9 +52,9 @@
 - 决策触发：每次 `factor_time_interval` 完成后由因子模块直接调用策略模块
 - 决策频率：仅在“因子时间区间完成”时触发（`factor_time_interval` 可配置，如 `20s`、`30s`）
 - 因子计算口径：因子由单个 `factor_time_interval` 区间内全部原始五档行情行聚合计算，因子表 `1` 行代表一个 `factor_time_interval` 结果
-- 因子与策略内存窗口：原始行情缓存目标固定为 `5` 分钟（`raw_market_cache_seconds=300`），同时在决策流水线内存中固定保留最近 `400` 行因子结果
-- 缓存来源约束：重启场景下因子模块必须从数据库同时加载原始行情缓存与因子缓存；非重启场景下两类缓存均由消费 topic 流持续滚动保留
-- 缓存淘汰约束：原始行情缓存必须记录“是否已参与因子计算”状态，未参与计算的数据不得从缓存删除
+- 因子与策略内存窗口：运行期原始行情缓存仅保留未闭合区间数据；重启回看窗口固定 `5` 分钟（`raw_market_cache_seconds=300`）；决策流水线内存固定保留最近 `400` 行因子结果
+- 缓存来源约束：重启场景下因子模块必须从数据库同时加载原始行情缓存与因子缓存；非重启场景下原始行情缓存由消费 topic 流实时构建，因子缓存由在线计算结果持续滚动保留
+- 缓存淘汰约束：原始行情缓存必须记录“是否已参与因子计算”状态；已闭合区间在计算完成后应整窗淘汰，未参与计算的数据不得删除
 - 合约切换约束：若次交易日生效后 `product_id` 的订阅合约集合发生变化，决策流水线必须清空该 `product_id` 的全部原始行情缓存、因子缓存与窗口游标，再重新累计到可决策状态
 - 行情服务职责边界：仅负责行情接收与消息发布，不负责标准化、窗口聚合和数据库落库
 - 行情主题约束：原始行情发布主题采用 `md.tick.raw.<product_id>`（如 `md.tick.raw.rb`、`md.tick.raw.IF`）
@@ -120,9 +120,9 @@
 - 因子基准实现：`MacroHFT_Features_SH/src/gen/feature_calculator.py`（`calculate_all_features` / `get_feature_columns`）
 - 品种因子清单：按 `product_id` 配置因子列表，仅输出该品种需要的因子列
 - 重启恢复：从 `md_tick_l2_rt` 加载最近 `raw_market_cache_seconds` 原始行情，并从 `factor_unit_rt` 加载最近 `400` 行因子到内存缓存
-- 非重启保留：原始行情缓存由 `md.tick.raw.<product_id>` 消费流持续保留，因子缓存由消费流驱动的在线计算结果持续保留
-- 维护内存窗口：固定 `5` 分钟原始行情窗口 + 最近 `400` 行因子缓存
-- 缓存状态与淘汰：原始行情缓存按 `raw_tick -> factor_calculated(bool)` 维护状态，仅允许淘汰“超出目标窗口且 `factor_calculated=true`”的数据
+- 非重启保留：因子缓存由在线计算结果持续保留；原始行情缓存仅保留未闭合区间并随闭合整窗淘汰
+- 维护内存窗口：运行期“未闭合区间原始缓存 + 最近 `400` 行因子缓存”
+- 缓存状态与淘汰：原始行情缓存按 `raw_tick -> factor_calculated(bool)` 维护状态，闭合区间计算完成后执行整窗淘汰
 - 因子区间闭合：按分钟锚点切分区间（如 `20s -> 00/20/40/60`），每个区间计算时使用该区间内全部原始数据行
 - 因子缓存顺序：按时间升序，最新行始终在末尾；超过 `400` 行淘汰最旧行
 - 合约切换处理：当 `contract.plan.generated.<product_id>` 生效且合约集合变化时，执行全量缓存清空并进入预热期，预热完成前不触发策略
@@ -248,10 +248,10 @@
 - 在线计算阶段采用两阶段链路：`FactorWindowContext`（区间全部原始行） -> `Factor PreCalculator` 产出 `MergedRawUnitRow`（合并后的原始数据） -> `Factor Calculator` 产出最终因子行
 - `MergedRawUnitRow` 需发布到 `md.tick.merged.<product_id>`，由归档服务写入 `merged_tick_l2_*`
 - 策略模块不消费因子消息，而是复用因子模块的进程内因子缓存与闭合回调
-- 内存窗口规则：原始行情缓存目标固定 `5` 分钟（`raw_market_cache_seconds=300`），并滚动保留最近 `400` 行因子结果
+- 内存窗口规则：运行期原始行情缓存仅保留未闭合区间数据；`raw_market_cache_seconds=300` 用于重启回看；因子缓存滚动保留最近 `400` 行结果
 - 时间分块规则：`factor_time_interval_seconds` 必须整除 `60`，并按分钟锚点闭合区间
 - 缓存来源规则：重启从 PostgreSQL 恢复；非重启从消费 topic 流持续保留
-- 原始行情淘汰规则：仅可淘汰“`factor_calculated=true` 且超出目标窗口”的数据；未计算数据不得删除
+- 原始行情淘汰规则：闭合区间完成计算后对该区间执行整窗淘汰；未计算数据不得删除
 - `MacroHFT_Features_SH/scripts/step4_preprocess_order_files_v2.py` 的 `interval` 聚合逻辑是当前离线口径基准；`vnpy_hft` 在线实现使用“原始行情缓存 + 因子缓存”的增量流式计算复现相同逻辑
 - 因子列输出规则：按 `product_id` 的因子配置列表裁剪，且配置项必须为 `get_feature_columns()` 子集
 
@@ -263,7 +263,7 @@
 - 生成订阅计划后发布事件并持久化，供次交易日开盘前加载
 - 行情采集服务在 `effective_trading_day` 到达时按 `cutover_time` 原子切换订阅合约
 - 决策流水线同步消费 `contract.plan.generated.<product_id>`，若检测到 `product_id` 的合约集合变化则全量清空缓存并进入预热
-- 预热完成定义：新合约集合内每个 `instrument_id` 至少完成 `1` 个 `factor_time_interval` 因子计算后，才恢复该 `product_id` 的策略决策
+- 预热完成定义：新合约集合内每个 `instrument_id` 的因子缓存行数达到 `factor_cache_rows` 后，才恢复该 `product_id` 的策略决策
 
 ## 8. 数据存储策略
 
@@ -337,38 +337,58 @@
 
 ## 12. 配置项清单（建议纳入配置中心）
 
-- `factor_time_interval`（每 1 行因子需要多少秒原始数据，如 `20s`、`30s`）
-- `strategy_trigger_mode=inprocess`
-- `order_timeout_ms`
-- `signal_ttl_ms`
-- `max_cancel_attempts`
-- `raw_market_cache_minutes=5`
-- `raw_market_cache_seconds=300`
-- `factor_cache_rows=400`
-- `factor_precalc_semantic=step4.aggregate_by_minute.v2`
-- `factor_precalc_interval_parser=step4.interval_to_seconds`
-- `factor_calculator_module=MacroHFT_Features_SH.src.gen.feature_calculator`
-- `factor_feature_list_by_product`
-- `factor_feature_list_by_product` 示例：`{"al":["wap_balance","price_spread"],"fu":["imbalance_top3","volatility_60"]}`
-- `factor_feature_list_strict=true`
-- `factor_switch_reset_mode=full_flush`
-- `factor_warmup_min_units=1`
-- `raw_cache_evict_requires_calculated=true`
-- `md_subject_pattern=md.tick.raw.{product_id}`
-- `md_merged_subject_pattern=md.tick.merged.{product_id}`
-- `contract_plan_subject_pattern=contract.plan.generated.{product_id}`
-- `factor_archive_subject_pattern=factor.unit.calculated.{product_id}`
-- `md_product_shard_subscriptions`
-- `market_collector_publish_buffer`
-- `market_collector_reconnect_backoff_ms`
-- `subscription_cutover_time`
-- `archive_writer_batch_rows`
-- `archive_writer_batch_ms`
-- `market_freshness_threshold_ms`
-- `position_freshness_threshold_ms`
-- `settlement_run_time`
-- `settlement_api_endpoint`
-- `contract_selection_metric=volume`
-- `contract_selection_top_n=4`
-- `archive_export_cron`
-- `archive_nas_path`
+通用调度与策略：
+
+- `strategy_trigger_mode=inprocess`：策略触发方式，固定为因子模块进程内回调。
+- `factor_time_interval`：因子区间长度（如 `20s`、`30s`），决定触发节奏。
+- `signal_ttl_ms`：信号有效期，超时不得下发。
+- `market_freshness_threshold_ms`：行情新鲜度阈值。
+- `position_freshness_threshold_ms`：持仓新鲜度阈值。
+
+执行与风控：
+
+- `order_timeout_ms`：委托超时阈值，超时触发撤单流程。
+- `max_cancel_attempts`：单笔委托最大撤单重试次数。
+
+因子与缓存：
+
+- `raw_market_cache_seconds=300`：启动恢复回看窗口（秒）。
+- `factor_cache_rows=400`：因子缓存保留行数。
+- `factor_feature_list_by_product`：按品种配置输出因子列，示例 `{"al":["wap_balance"],"fu":["imbalance_top3"]}`。
+- `factor_feature_list_strict=true`：严格校验因子列名，必须为 `get_feature_columns()` 子集。
+- `factor_switch_reset_mode=full_flush`：合约切换时缓存重置策略。
+- `raw_cache_evict_requires_calculated=true`：仅允许淘汰已参与计算的原始数据。
+
+主题与分片：
+
+- `md_subject_pattern=md.tick.raw.{product_id}`：原始行情主题模板。
+- `md_merged_subject_pattern=md.tick.merged.{product_id}`：合并原始行主题模板。
+- `factor_archive_subject_pattern=factor.unit.calculated.{product_id}`：因子归档主题模板。
+- `contract_plan_subject_pattern=contract.plan.generated.{product_id}`：次交易日订阅计划主题模板。
+- `md_product_shard_subscriptions`：行情服务按品种分片订阅配置。
+
+行情采集：
+
+- `market_collector_publish_buffer`：行情发布缓冲区大小。
+- `market_collector_reconnect_backoff_ms`：断线重连退避时间。
+- `subscription_cutover_time`：次交易日订阅切换时间点。
+
+归档：
+
+- `archive_writer_batch_rows`：归档批量写入行数。
+- `archive_writer_batch_ms`：归档批量写入时间窗口。
+- `archive_export_cron`：NAS 导出调度表达式。
+- `archive_nas_path`：NAS 根目录路径。
+
+结算与订阅规划：
+
+- `settlement_run_time`：日终结算任务时间。
+- `settlement_api_endpoint`：外部结算接口地址。
+- `contract_selection_metric=volume`：次日主力合约筛选指标。
+- `contract_selection_top_n=4`：每品种次日订阅合约数量。
+
+去重说明：
+
+- 已删除重复功能配置 `raw_market_cache_minutes`，统一使用 `raw_market_cache_seconds`。
+- `factor_precalc_semantic`、`factor_precalc_interval_parser`、`factor_calculator_module` 属于实现基线，不作为运行时配置。
+- `factor_warmup_min_units` 与 `factor_cache_rows` 目标重复，已删除；预热阈值统一使用 `factor_cache_rows`。

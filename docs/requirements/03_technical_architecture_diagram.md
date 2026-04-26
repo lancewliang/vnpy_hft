@@ -92,7 +92,7 @@ sequenceDiagram
 
     MQ->>DP: 分发 md.tick.raw.<product_id>
     DP->>FE: 因子模块消费原始行情
-    FE->>FE: 更新原始行情缓存(目标=5分钟)
+    FE->>FE: 更新未闭合区间原始行情缓存
     FE->>FE: 按分钟锚点维护 factor_time_interval 区间并触发闭合
     FE->>FE: 为每个闭合区间构建 FactorWindowContext(包含该区间全部原始行)
     FE->>FE: Factor PreCalculator 生成 MergedRawUnitRow(合并后的原始数据)
@@ -100,7 +100,7 @@ sequenceDiagram
     MQ->>AS: 消费 md.tick.merged.*
     AS->>PG: 写入 merged_tick_l2(1行=x秒)
     FE->>FE: Factor Calculator 基于 feature_calculator 产出因子行
-    FE->>FE: 标记 raw tick 的 factor_calculated 状态并仅淘汰已计算超窗数据
+    FE->>FE: 标记闭合区间 raw tick 为 factor_calculated=true 并整窗淘汰
     FE->>FE: 更新最近 400 行因子内存缓存
     FE->>SE: 进程内直接调用策略计算
     FE->>MQ: 发布 factor.unit.calculated.<product_id>
@@ -157,7 +157,7 @@ sequenceDiagram
 - 因子口径：`1` 行因子 = `1` 个 `factor_time_interval` 区间结果。
 - 术语口径：`product_id` 是品种（如 `rb`），`instrument_id` 是具体合约（如 `rb2610`），`vt_symbol=instrument_id.exchange`。
 - 解析规则：`product_id` 由 `instrument_id` 去掉末尾数字得到（如 `rb2610 -> rb`、`IF2606 -> IF`）。
-- 内存窗口：原始行情缓存目标为固定 `5` 分钟（`raw_market_cache_seconds=300`）+ 最近 `400` 行因子缓存。
+- 内存窗口：运行期原始行情缓存仅保留未闭合区间；`raw_market_cache_seconds=300` 用于重启回看 + 最近 `400` 行因子缓存。
 - 区间规则：`factor_time_interval_seconds` 需整除 `60`，按分钟锚点闭合（如 `20s -> 00/20/40/60`）。
 - 上下文规则：`FactorWindowContext` 必须包含对应区间的全部原始数据行。
 - 两阶段计算：先由 `Factor PreCalculator` 生成 `MergedRawUnitRow`，再由 `Factor Calculator` 计算最终因子行。
@@ -165,9 +165,9 @@ sequenceDiagram
 - 口径对齐：PreCalculator 对齐 `step4_preprocess_order_files_v2.py` 的 `interval_to_seconds()` 与 `aggregate_by_minute()`。
 - 因子口径：`feature_calculator.py` 的 `calculate_all_features()` 为计算基准，`get_feature_columns()` 为因子列校验基准。
 - 因子配置：按 `product_id` 配置因子列表，输出列必须是 `get_feature_columns()` 子集。
-- 缓存来源：重启时因子模块从 PostgreSQL 加载两类缓存；非重启时两类缓存从消费 topic 流持续滚动保留。
-- 淘汰规则：原始行情缓存记录 `factor_calculated` 状态，未计算数据不得淘汰。
-- 合约切换：若 `product_id` 合约集合变化，因子模块全量清空缓存并预热，预热完成前不触发策略。
+- 缓存来源：重启时因子模块从 PostgreSQL 加载两类缓存；非重启时原始行情缓存由消费 topic 流实时构建，因子缓存由在线计算结果持续滚动保留。
+- 淘汰规则：闭合区间计算完成后整窗淘汰，未计算数据不得淘汰。
+- 合约切换：若 `product_id` 合约集合变化，因子模块全量清空缓存并预热；预热阈值按 `factor_cache_rows` 达标后恢复策略触发。
 - 行情采集职责：只接收并发布 `md.tick.raw.<product_id>`，不直接落库。
 - 行情采集轻量化：不做标准化、窗口聚合和数据库写入。
 - 归档职责：独立消费 `md.tick.raw.*`、`md.tick.merged.*` 与 `factor.unit.calculated.*` 并写入 PostgreSQL。
