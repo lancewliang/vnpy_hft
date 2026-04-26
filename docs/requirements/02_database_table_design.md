@@ -10,9 +10,10 @@
 - 高频核心表采用“实时表 + 历史表”双表设计
 - 日终归档：每天下午收盘后执行，从实时库归档到历史库
 - 不使用 `bar` 数据表，行情基准仅为 `md_tick_l2`
-- 因子由 `tick_l2` 聚合得到（`1` 行因子 = `1` 个 `factor_time_interval` 区间结果）
+- 因子由 `tick_l2` 经区间合并后聚合得到（`1` 行因子 = `1` 个 `factor_time_interval` 区间结果）
 - 行情服务（Market Collector）不直接写库，仅发布 `md.tick.raw.<product_id>`
 - 归档服务（Archive Service）消费 `md.tick.raw.*` 并写入 `md_tick_l2_*`
+- 因子服务发布 `md.tick.merged.<product_id>`（合并后的原始行），归档服务消费后写入 `merged_tick_l2_*`
 - 因子服务发布 `factor.unit.calculated.<product_id>`，归档服务消费后写入 `factor_unit_*`
 - `factor_time_interval` 区间闭合由因子服务维护，策略模块通过进程内调用直接复用闭合结果
 
@@ -33,6 +34,7 @@
 示例：
 
 - `md_tick_l2_rt` / `md_tick_l2_his`
+- `merged_tick_l2_rt` / `merged_tick_l2_his`
 - `factor_unit_rt` / `factor_unit_his`
 - `order_submit_rt` / `order_submit_his`
 - `cancel_request_rt` / `cancel_request_his`
@@ -49,6 +51,7 @@
 ## 3. 高频双表清单（实时 + 历史）
 
 - `md_tick_l2_rt` / `md_tick_l2_his`：秒级五档行情
+- `merged_tick_l2_rt` / `merged_tick_l2_his`：按 `factor_time_interval` 合并后的原始行
 - `factor_unit_rt` / `factor_unit_his`：按 `factor_time_interval` 聚合的因子结果
 - `order_submit_rt` / `order_submit_his`：下单记录
 - `cancel_request_rt` / `cancel_request_his`：撤单记录（多次撤单多行）
@@ -56,7 +59,7 @@
 
 说明：
 
-- 上述 5 组表同构（字段一致、约束一致）
+- 上述 6 组高频双表遵循统一命名与归档规则（各组内 `rt/his` 同构）
 - 实时表用于在线读取和写入
 - 历史表用于全量长期保存
 - 各表写入由对应业务服务负责（归档/执行/结算等），非统一由行情服务写入
@@ -100,12 +103,65 @@
 - 可选唯一键：`UNIQUE (ingest_id)`
 - 索引：`(trading_day, instrument_id, ts)`、`(rev_ts)`
 
-## 4.2 因子表：`factor_unit_rt` / `factor_unit_his`
+## 4.2 合并原始行表：`merged_tick_l2_rt` / `merged_tick_l2_his`
+
+用途：
+
+- 保存 `Factor PreCalculator` 产出的 `MergedRawUnitRow`（`1` 行 = `1` 个 `factor_time_interval` 区间）
+- 字段语义对齐 `step4_preprocess_order_files_v2.py` 的 `aggregate_by_minute()` 输出列
+- 写入主体：归档服务（消费 `md.tick.merged.*`）
+
+建议字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | BIGSERIAL | 主键 |
+| trading_day | DATE NOT NULL | 交易日 |
+| exchange | VARCHAR(8) NOT NULL | 交易所 |
+| product_id | VARCHAR(16) NOT NULL | 品种 |
+| instrument_id | VARCHAR(32) NOT NULL | 合约 |
+| factor_time_interval | VARCHAR(16) NOT NULL | 聚合区间，如 `20s`、`30s` |
+| unit_start_ts | TIMESTAMPTZ NOT NULL | 区间开始时间 |
+| unit_end_ts | TIMESTAMPTZ NOT NULL | 区间结束时间 |
+| datetime | TIMESTAMPTZ NOT NULL | 窗口内最后一条快照时间（对齐 step4 `datetime`） |
+| minute | TIMESTAMPTZ NOT NULL | 截断后的区间桶时间（对齐 step4 `minute`） |
+| is_consecutive_minute | SMALLINT NOT NULL | 连续窗口标记（0/1） |
+| open_price | NUMERIC(18,8) | 窗口首笔 `LastPrice` |
+| high_price | NUMERIC(18,8) | 窗口内盘口价格极大值 |
+| low_price | NUMERIC(18,8) | 窗口内盘口价格极小值 |
+| close_price | NUMERIC(18,8) | 窗口末笔 `LastPrice` |
+| total_trade_volume | BIGINT | 窗口末笔累计成交量 |
+| turnover | NUMERIC(20,4) | 窗口末笔累计成交额 |
+| open_interest | NUMERIC(20,4) | 窗口末笔持仓量 |
+| bid1_price..bid5_price | NUMERIC(18,8) | 买一到买五价（窗口末笔快照） |
+| bid1_size..bid5_size | BIGINT | 买一到买五量（窗口末笔快照） |
+| ask1_price..ask5_price | NUMERIC(18,8) | 卖一到卖五价（窗口末笔快照） |
+| ask1_size..ask5_size | BIGINT | 卖一到卖五量（窗口末笔快照） |
+| aggregation_semantic | VARCHAR(64) NOT NULL DEFAULT 'step4.aggregate_by_minute.v2' | 聚合语义版本 |
+| precalc_rev | INTEGER NOT NULL DEFAULT 1 | 预聚合修订号（append-only） |
+| rev_ts | TIMESTAMPTZ NOT NULL | 系统接收合并事件时间 |
+| source | VARCHAR(32) NOT NULL DEFAULT 'factor_engine' | 数据来源 |
+| ingest_id | UUID | 幂等键（可选） |
+| created_ts | TIMESTAMPTZ NOT NULL DEFAULT now() | 入库时间 |
+
+约束和索引建议：
+
+- 唯一键：`UNIQUE (instrument_id, factor_time_interval, unit_end_ts, precalc_rev)`
+- 可选唯一键：`UNIQUE (ingest_id)`
+- 索引：`(trading_day, instrument_id, unit_end_ts)`、`(product_id, minute)`、`(rev_ts)`
+
+口径规则：
+
+- `datetime`、`minute`、`is_consecutive_minute` 与价格/量字段严格对齐 `aggregate_by_minute()` 输出语义
+- `minute` 虽命名为 minute，但实际是按 `factor_time_interval` 截断后的区间桶
+- 每行覆盖 `[unit_start_ts, unit_end_ts)` 的所有原始行情行
+
+## 4.3 因子表：`factor_unit_rt` / `factor_unit_his`
 
 用途：
 
 - 因子结果表，`1` 行 = `1` 个 `factor_time_interval` 区间结果
-- 数据来源为 `md_tick_l2_*`，不是 bar 数据
+- 数据来源为因子服务计算结果（底层来自 `md_tick_l2_*` 与 `merged_tick_l2_*`），不是 bar 数据
 - 写入主体：归档服务（消费 `factor.unit.calculated.*`）
 
 建议字段：
@@ -138,7 +194,7 @@
 - `factor_time_interval` 表示每行因子使用多少秒原始数据进行聚合
 - 每行因子使用 `[unit_start_ts, unit_end_ts)` 范围内的 `tick_l2` 聚合计算
 
-## 4.3 下单表：`order_submit_rt` / `order_submit_his`
+## 4.4 下单表：`order_submit_rt` / `order_submit_his`
 
 建议字段：
 
@@ -172,7 +228,7 @@
 - 唯一键：`UNIQUE (account_id, front_id, session_id, order_ref)`
 - 索引：`(trading_day, account_id, instrument_id)`、`(cycle_id)`、`(order_sys_id)`
 
-## 4.4 撤单表：`cancel_request_rt` / `cancel_request_his`
+## 4.5 撤单表：`cancel_request_rt` / `cancel_request_his`
 
 建议字段：
 
@@ -200,7 +256,7 @@
 - 唯一键：`UNIQUE (order_submit_id, attempt_no)`
 - 索引：`(trading_day, account_id)`、`(order_submit_id, request_ts)`
 
-## 4.5 成交表：`trade_fill_rt` / `trade_fill_his`
+## 4.6 成交表：`trade_fill_rt` / `trade_fill_his`
 
 建议字段：
 
@@ -250,7 +306,7 @@
 
 收盘后执行归档任务（建议按交易日粒度）：
 
-1. 将 `T` 日数据从 `*_rt` 复制到 `*_his`
+1. 将 `T` 日数据从 `*_rt` 复制到 `*_his`（含 `md_tick_l2_*`、`merged_tick_l2_*`、`factor_unit_*` 等）
 2. 逐表做行数校验、可选校验和校验
 3. 校验通过后标记归档完成
 4. 清理实时表中过期数据，仅保留最近 2 个交易日（`T` 和 `T-1`）
@@ -270,12 +326,15 @@
 ## 7. 文件归档与回放
 
 - 每日收盘后，从 `md_tick_l2_his` 导出 `CSV(.zst)` 到 NAS
+- 每日收盘后，从 `merged_tick_l2_his` 与 `factor_unit_his` 同步导出归档文件
 - 回放仅依赖归档文件，不依赖 PostgreSQL
-- 本系统不需要 bar 文件，回放输入为 `tick_l2` 原始行情
+- 本系统不需要 bar 文件，回放输入为 `tick_l2` 原始行情与 `merged_tick_l2` 合并行情
 
 建议目录：
 
 - `/nas/archive/md_tick_l2/trading_day=YYYYMMDD/exchange=SHFE/instrument_id=rbXXXX.csv.zst`
+- `/nas/archive/merged_tick_l2/trading_day=YYYYMMDD/exchange=SHFE/instrument_id=rbXXXX.csv.zst`
+- `/nas/archive/factor_unit/trading_day=YYYYMMDD/exchange=SHFE/instrument_id=rbXXXX.csv.zst`
 
 建议清单文件（manifest）字段：
 
@@ -295,13 +354,14 @@
 
 - 下单锚点：`account_id + front_id + session_id + order_ref`
 - 成交锚点：`account_id + trade_id`
+- 合并原始行锚点：`instrument_id + factor_time_interval + unit_end_ts + precalc_rev`
 - 因子锚点：`instrument_id + factor_time_interval + unit_end_ts + factor_set + calc_rev`
 - 入库幂等：`ON CONFLICT DO NOTHING`
 
 ## 10. DDL 落地顺序建议
 
 1. 创建表空间 `ts_realtime`、`ts_history`
-2. 创建 5 组高频双表（`*_rt`、`*_his`）与分区模板
+2. 创建 6 组高频双表（`*_rt`、`*_his`）与分区模板
 3. 创建低频历史表（结算、结算快照、订阅计划）
 4. 创建索引和唯一约束
 5. 上线日终归档任务与校验任务

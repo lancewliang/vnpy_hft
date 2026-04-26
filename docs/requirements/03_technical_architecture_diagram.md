@@ -84,7 +84,7 @@ sequenceDiagram
     participant OMS as 交易执行
     participant PG as PostgreSQL
 
-    EX->>MC: 推送 1 秒五档行情
+    EX->>MC: 推送原始五档行情(tick频率)
     MC->>MQ: 发布 md.tick.raw.<product_id>
     MQ->>AS: 消费 md.tick.raw.*
     AS->>PG: 写入 md_tick_l2
@@ -92,7 +92,15 @@ sequenceDiagram
 
     MQ->>DP: 分发 md.tick.raw.<product_id>
     DP->>FE: 因子模块消费原始行情
-    FE->>FE: 维护 factor_time_interval 区间并触发闭合
+    FE->>FE: 更新原始行情缓存(目标=5分钟)
+    FE->>FE: 按分钟锚点维护 factor_time_interval 区间并触发闭合
+    FE->>FE: 为每个闭合区间构建 FactorWindowContext(包含该区间全部原始行)
+    FE->>FE: Factor PreCalculator 生成 MergedRawUnitRow(合并后的原始数据)
+    FE->>MQ: 发布 md.tick.merged.<product_id>
+    MQ->>AS: 消费 md.tick.merged.*
+    AS->>PG: 写入 merged_tick_l2(1行=x秒)
+    FE->>FE: Factor Calculator 基于 feature_calculator 产出因子行
+    FE->>FE: 标记 raw tick 的 factor_calculated 状态并仅淘汰已计算超窗数据
     FE->>FE: 更新最近 400 行因子内存缓存
     FE->>SE: 进程内直接调用策略计算
     FE->>MQ: 发布 factor.unit.calculated.<product_id>
@@ -123,6 +131,8 @@ sequenceDiagram
     participant PG as PostgreSQL
     participant MQ as NATS
     participant MC as 行情采集
+    participant DP as 决策流水线
+    participant FE as 因子模块
 
     SCH->>SS: 收盘后触发结算任务
     SS->>API: 拉取按品种全合约结算+成交量
@@ -133,19 +143,34 @@ sequenceDiagram
     SS->>CSP: 触发次交易日订阅规划
 
     CSP->>PG: 按品种成交量排序并落库 next_day_subscription_plan(Top4)
-    CSP->>MQ: 发布 contract.plan.generated(含 effective_trading_day/cutover_time)
+    CSP->>MQ: 发布 contract.plan.generated.<product_id>(含 effective_trading_day/cutover_time)
 
     MQ-->>MC: 下发次交易日订阅计划
     MC->>MC: 到达 cutover_time 原子切换订阅合约池(Top4)
+    MQ-->>DP: 下发次交易日订阅计划
+    DP->>FE: 合约集合变化则全量清缓存并进入预热
+    FE->>DP: 预热完成后恢复策略触发
 ```
 
 ## 说明
 
 - 因子口径：`1` 行因子 = `1` 个 `factor_time_interval` 区间结果。
-- 内存窗口：固定 `400` 秒五档行情 + 最近 `400` 行因子缓存。
+- 术语口径：`product_id` 是品种（如 `rb`），`instrument_id` 是具体合约（如 `rb2610`），`vt_symbol=instrument_id.exchange`。
+- 解析规则：`product_id` 由 `instrument_id` 去掉末尾数字得到（如 `rb2610 -> rb`、`IF2606 -> IF`）。
+- 内存窗口：原始行情缓存目标为固定 `5` 分钟（`raw_market_cache_seconds=300`）+ 最近 `400` 行因子缓存。
+- 区间规则：`factor_time_interval_seconds` 需整除 `60`，按分钟锚点闭合（如 `20s -> 00/20/40/60`）。
+- 上下文规则：`FactorWindowContext` 必须包含对应区间的全部原始数据行。
+- 两阶段计算：先由 `Factor PreCalculator` 生成 `MergedRawUnitRow`，再由 `Factor Calculator` 计算最终因子行。
+- 合并行归档：`MergedRawUnitRow` 需要发布到 `md.tick.merged.<product_id>` 并由归档服务写入 `merged_tick_l2_*`。
+- 口径对齐：PreCalculator 对齐 `step4_preprocess_order_files_v2.py` 的 `interval_to_seconds()` 与 `aggregate_by_minute()`。
+- 因子口径：`feature_calculator.py` 的 `calculate_all_features()` 为计算基准，`get_feature_columns()` 为因子列校验基准。
+- 因子配置：按 `product_id` 配置因子列表，输出列必须是 `get_feature_columns()` 子集。
+- 缓存来源：重启时因子模块从 PostgreSQL 加载两类缓存；非重启时两类缓存从消费 topic 流持续滚动保留。
+- 淘汰规则：原始行情缓存记录 `factor_calculated` 状态，未计算数据不得淘汰。
+- 合约切换：若 `product_id` 合约集合变化，因子模块全量清空缓存并预热，预热完成前不触发策略。
 - 行情采集职责：只接收并发布 `md.tick.raw.<product_id>`，不直接落库。
 - 行情采集轻量化：不做标准化、窗口聚合和数据库写入。
-- 归档职责：独立消费 `md.tick.raw.*` 与 `factor.unit.calculated.*` 并写入 PostgreSQL。
+- 归档职责：独立消费 `md.tick.raw.*`、`md.tick.merged.*` 与 `factor.unit.calculated.*` 并写入 PostgreSQL。
 - 时间区间闭合：由因子模块维护；策略模块通过进程内调用直接复用闭合结果。
 - 分片扩展：决策流水线必须按 `product_id` 分配实例，不同品种不得在同一计算实例内混跑。
 - 部署示例：`AL` 启动 `decision-pipeline-AL`，`FU` 启动 `decision-pipeline-FU`，分别订阅 `md.tick.raw.AL`、`md.tick.raw.FU`。

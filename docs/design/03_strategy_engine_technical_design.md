@@ -13,6 +13,13 @@
 
 本设计中的策略模块是 `Decision Pipeline` 的一部分，和因子模块同进程部署。
 
+术语说明：
+
+- `product_id`：品种标识（如 `rb`、`al`、`IF`）
+- `instrument_id`：合约标识（如 `rb2610`、`IF2606`）
+- `vt_symbol`：`vnpy` 本地合约代码（`instrument_id.exchange`）
+- 解析规则：`product_id` 由 `instrument_id` 去掉末尾数字得到（如 `rb2610 -> rb`、`IF2606 -> IF`）
+
 ## 2. 职责边界
 
 ### 2.1 策略模块只负责
@@ -105,6 +112,7 @@ flowchart LR
 职责：
 
 - 接收因子模块传入的 `FactorDecisionContext`
+- `FactorDecisionContext` 由 `FactorWindowContext + 当前因子结果 + 因子缓存快照` 组装而成
 - 读取当前因子值与最近 `400` 行因子缓存
 - 作为策略计算的唯一触发入口
 
@@ -131,7 +139,7 @@ flowchart LR
 职责：
 
 - 对接 `ArchetypeTrader` 中迁移后的在线推断逻辑
-- 将当前因子、最近 `400` 行因子缓存、对应 `factor_time_interval` 的行情窗口、持仓状态组装为模型输入
+- 将当前因子、最近 `400` 行因子缓存、`FactorWindowContext`（区间内全部原始数据行）、持仓状态组装为模型输入
 - 输出目标信号或目标仓位
 
 要求：
@@ -165,6 +173,7 @@ flowchart LR
 - 每次由因子模块完成一个 `factor_time_interval` 后立即触发一次策略计算
 - 若同一周期已存在未终态委托，则直接跳过
 - 策略模块不再单独消费 `md.tick.raw.<product_id>` 或 `factor.unit.calculated.<product_id>`
+- 若因子模块处于“合约切换预热期”，则强制跳过策略触发
 
 ### 7.2 周期与幂等
 
@@ -183,6 +192,12 @@ flowchart LR
 - 输入中必须包含当前持仓
 - 持仓状态需与活动委托联动检查，避免脏读
 - 若持仓快照过旧，本轮决策必须跳过
+
+### 7.5 合约切换闸门
+
+- 当 `product_id` 的合约集合发生切换时，策略模块必须等待因子模块预热完成
+- 预热完成前不发布任何 `strategy.signal`
+- 预热完成后按新 `instrument_id` 集合恢复周期触发
 
 ## 8. 事件模型
 
@@ -245,6 +260,7 @@ sequenceDiagram
 - 因子上下文缺失：跳过本轮决策并告警
 - 持仓状态过旧：跳过本轮决策
 - 策略推理失败：记录错误并丢弃本轮周期
+- 因子模块预热未完成：持续跳过决策并输出告警
 
 ## 11. 部署规范
 
@@ -278,6 +294,7 @@ sequenceDiagram
 - `strategy_id`
 - `strategy_version`
 - `max_cycle_retry`
+- `strategy_wait_factor_warmup=true`
 
 ## 13. 可观测性与告警
 

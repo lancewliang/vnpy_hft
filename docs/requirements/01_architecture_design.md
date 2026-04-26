@@ -36,6 +36,14 @@
 - 将 `ArchetypeTrader` 的策略决策代码移植为 `Strategy Engine` 在线服务
 - 在 `vnpy_hft` 内完成统一的数据、风控、调度与监控闭环
 
+### 1.3 术语定义（统一口径）
+
+- `product_id`：交易品种标识（如 `rb`、`al`、`IF`），用于主题分片与服务部署分片
+- `instrument_id`：具体可交易合约标识（如 `rb2610`、`al2609`、`IF2606`），用于逐合约计算与幂等
+- `vt_symbol`：`vnpy` 本地合约代码，格式为 `instrument_id.exchange`（如 `rb2610.SHFE`）
+- 映射关系：一个 `product_id` 下可包含多个 `instrument_id`
+- 解析规则：`product_id` 由 `instrument_id` 去掉末尾数字得到（如 `rb2610 -> rb`、`IF2606 -> IF`）
+
 ## 2. 关键业务约束（已定稿）
 
 - 目标交易所：上海期货交易所（SHFE）、中国金融期货交易所（CFFEX）
@@ -43,11 +51,14 @@
 - 交易日定义：`T日 = T-1 夜盘 + T日上午 + T日下午`
 - 决策触发：每次 `factor_time_interval` 完成后由因子模块直接调用策略模块
 - 决策频率：仅在“因子时间区间完成”时触发（`factor_time_interval` 可配置，如 `20s`、`30s`）
-- 因子计算口径：因子由最近 `factor_time_interval` 对应秒数的 1 秒五档行情聚合计算，因子表 `1` 行代表一个 `factor_time_interval` 结果
-- 因子与策略内存窗口：固定保留最近 `400` 秒 1 秒五档行情，同时在决策流水线内存中保留最近 `400` 行因子结果
+- 因子计算口径：因子由单个 `factor_time_interval` 区间内全部原始五档行情行聚合计算，因子表 `1` 行代表一个 `factor_time_interval` 结果
+- 因子与策略内存窗口：原始行情缓存目标固定为 `5` 分钟（`raw_market_cache_seconds=300`），同时在决策流水线内存中固定保留最近 `400` 行因子结果
+- 缓存来源约束：重启场景下因子模块必须从数据库同时加载原始行情缓存与因子缓存；非重启场景下两类缓存均由消费 topic 流持续滚动保留
+- 缓存淘汰约束：原始行情缓存必须记录“是否已参与因子计算”状态，未参与计算的数据不得从缓存删除
+- 合约切换约束：若次交易日生效后 `product_id` 的订阅合约集合发生变化，决策流水线必须清空该 `product_id` 的全部原始行情缓存、因子缓存与窗口游标，再重新累计到可决策状态
 - 行情服务职责边界：仅负责行情接收与消息发布，不负责标准化、窗口聚合和数据库落库
 - 行情主题约束：原始行情发布主题采用 `md.tick.raw.<product_id>`（如 `md.tick.raw.rb`、`md.tick.raw.IF`）
-- 行情与因子落库职责：由独立归档服务分别消费 `md.tick.raw.*` 与 `factor.unit.calculated.<product_id>` 后写入 PostgreSQL
+- 行情与因子落库职责：由独立归档服务分别消费 `md.tick.raw.*`、`md.tick.merged.*` 与 `factor.unit.calculated.<product_id>` 后写入 PostgreSQL
 - 时间区间职责：`factor_time_interval` 闭合由因子模块维护并触发，策略模块通过进程内调用直接复用闭合结果
 - 前置约束：必须满足“当前委托已结束（成交/撤单）+ 持仓新鲜 + 行情新鲜 + 风控通过”后，才允许新一轮策略
 - 信号时效：策略结果带有效期，过期不得下发到执行层
@@ -94,9 +105,9 @@
 
 ### 5.2 归档服务（Archive Service）
 
-- 独立消费 `md.tick.raw.*` 原始行情事件与 `factor.unit.calculated.*`
+- 独立消费 `md.tick.raw.*` 原始行情事件、`md.tick.merged.*` 合并原始行事件与 `factor.unit.calculated.*`
 - 负责行情标准化、因子归档转换与幂等处理
-- 写入 PostgreSQL 行情表与因子表（append-only）
+- 写入 PostgreSQL 行情表、合并原始行表与因子表（append-only）
 - 执行实时库与历史库归档策略，输出 NAS 文件归档
 
 ### 5.3 因子服务（Factor Engine）
@@ -104,10 +115,20 @@
 - 代码来源：主要移植 `MacroHFT_Features_SH` 因子工程代码，并改造为在线计算服务
 - 物理部署：与策略模块按 `product_id` 同进程部署，组成 `Decision Pipeline`
 - 因子计算口径：`factor_time_interval` 定义每个因子行需要多少秒原始数据参与计算，例如 `20s`、`30s`
-- 启动恢复：从 `factor_unit_rt` 为当前 `product_id` 各合约加载最近 `400` 行因子到内存缓存
-- 维护内存窗口：固定 `400` 秒原始五档行情窗口 + 最近 `400` 行因子缓存
+- 两阶段链路：`Factor PreCalculator` 先将区间内原始行情合并为 `MergedRawUnitRow`，`Factor Calculator` 再基于合并结果计算最终因子行
+- 语义基准：`Factor PreCalculator` 对齐 `step4_preprocess_order_files_v2.py` 的 `interval_to_seconds()` 与 `aggregate_by_minute()`
+- 因子基准实现：`MacroHFT_Features_SH/src/gen/feature_calculator.py`（`calculate_all_features` / `get_feature_columns`）
+- 品种因子清单：按 `product_id` 配置因子列表，仅输出该品种需要的因子列
+- 重启恢复：从 `md_tick_l2_rt` 加载最近 `raw_market_cache_seconds` 原始行情，并从 `factor_unit_rt` 加载最近 `400` 行因子到内存缓存
+- 非重启保留：原始行情缓存由 `md.tick.raw.<product_id>` 消费流持续保留，因子缓存由消费流驱动的在线计算结果持续保留
+- 维护内存窗口：固定 `5` 分钟原始行情窗口 + 最近 `400` 行因子缓存
+- 缓存状态与淘汰：原始行情缓存按 `raw_tick -> factor_calculated(bool)` 维护状态，仅允许淘汰“超出目标窗口且 `factor_calculated=true`”的数据
+- 因子区间闭合：按分钟锚点切分区间（如 `20s -> 00/20/40/60`），每个区间计算时使用该区间内全部原始数据行
+- 因子缓存顺序：按时间升序，最新行始终在末尾；超过 `400` 行淘汰最旧行
+- 合约切换处理：当 `contract.plan.generated.<product_id>` 生效且合约集合变化时，执行全量缓存清空并进入预热期，预热完成前不触发策略
 - 由因子服务自身维护 `factor_time_interval` 闭合，并在区间完成时计算因子
-- 对外仅发布 `factor.unit.calculated.<product_id>` 供归档服务落库
+- 对外发布 `md.tick.merged.<product_id>`（合并后的原始行）供归档服务落库
+- 对外发布 `factor.unit.calculated.<product_id>` 供归档服务落库
 - 对内通过进程内内存调用直接触发策略模块计算
 
 ### 5.4 策略服务（Strategy Engine）
@@ -150,7 +171,7 @@
 - 按品种对合约成交量排名
 - 默认规则：每个品种选择当日成交量前4合约作为次交易日主订阅合约池
 - 输出并持久化次交易日订阅计划（含 `effective_trading_day`、`cutover_time`）
-- 将订阅计划发布给行情采集与策略服务（次交易日生效）
+- 按品种发布 `contract.plan.generated.<product_id>` 给行情采集与决策流水线（次交易日生效）
 
 ### 5.9 监控告警服务（Observability）
 
@@ -166,7 +187,8 @@
 
 建议主题（subject）：
 
-- `md.tick.raw.<product_id>`：原始秒级行情（按品种分片）
+- `md.tick.raw.<product_id>`：原始五档行情（按品种分片）
+- `md.tick.merged.<product_id>`：按 `factor_time_interval` 合并后的原始行（按品种分片）
 - `md.tick.archived`：行情归档写库完成事件
 - `factor.unit.calculated.<product_id>`：因子结果归档事件
 - `strategy.signal`：策略信号
@@ -179,7 +201,7 @@
 - `settlement.contract.synced`：外部结算接口同步完成
 - `contract.volume.rank`：品种合约成交量排名
 - `settlement.daily`：日终结算完成
-- `contract.plan.generated`：夜盘/次日合约池
+- `contract.plan.generated.<product_id>`：夜盘/次日合约池（按品种分片）
 
 ### 6.2 同步查询通道
 
@@ -220,11 +242,18 @@
 ### 7.5 因子口径与窗口约束
 
 - `factor_time_interval` 表示生成 `1` 行因子需要多少秒原始数据，格式与离线脚本一致，使用如 `20s`、`30s`
+- 作用定义：`factor_time_interval` 决定单行因子的时间覆盖范围、策略触发节奏以及归档主键粒度
 - 每个 `factor_unit` 行对应一个 `factor_time_interval` 区间（`unit_start_ts` 到 `unit_end_ts`）
 - 因子模块消费 `md.tick.raw.<product_id>` 并维护 `factor_time_interval` 闭合
+- 在线计算阶段采用两阶段链路：`FactorWindowContext`（区间全部原始行） -> `Factor PreCalculator` 产出 `MergedRawUnitRow`（合并后的原始数据） -> `Factor Calculator` 产出最终因子行
+- `MergedRawUnitRow` 需发布到 `md.tick.merged.<product_id>`，由归档服务写入 `merged_tick_l2_*`
 - 策略模块不消费因子消息，而是复用因子模块的进程内因子缓存与闭合回调
-- 内存窗口固定覆盖最近 `400` 秒原始行情，并滚动保留最近 `400` 行因子结果
+- 内存窗口规则：原始行情缓存目标固定 `5` 分钟（`raw_market_cache_seconds=300`），并滚动保留最近 `400` 行因子结果
+- 时间分块规则：`factor_time_interval_seconds` 必须整除 `60`，并按分钟锚点闭合区间
+- 缓存来源规则：重启从 PostgreSQL 恢复；非重启从消费 topic 流持续保留
+- 原始行情淘汰规则：仅可淘汰“`factor_calculated=true` 且超出目标窗口”的数据；未计算数据不得删除
 - `MacroHFT_Features_SH/scripts/step4_preprocess_order_files_v2.py` 的 `interval` 聚合逻辑是当前离线口径基准；`vnpy_hft` 在线实现使用“原始行情缓存 + 因子缓存”的增量流式计算复现相同逻辑
+- 因子列输出规则：按 `product_id` 的因子配置列表裁剪，且配置项必须为 `get_feature_columns()` 子集
 
 ### 7.6 日终结算与次交易日订阅
 
@@ -233,6 +262,8 @@
 - 默认选取每个品种成交量前4的合约，作为次交易日订阅合约池
 - 生成订阅计划后发布事件并持久化，供次交易日开盘前加载
 - 行情采集服务在 `effective_trading_day` 到达时按 `cutover_time` 原子切换订阅合约
+- 决策流水线同步消费 `contract.plan.generated.<product_id>`，若检测到 `product_id` 的合约集合变化则全量清空缓存并进入预热
+- 预热完成定义：新合约集合内每个 `instrument_id` 至少完成 `1` 个 `factor_time_interval` 因子计算后，才恢复该 `product_id` 的策略决策
 
 ## 8. 数据存储策略
 
@@ -241,6 +272,7 @@
 - 保存全量数据
 - 逻辑上 append-only（只插入，不更新）
 - 行情数据与因子数据由归档服务写入；决策流水线不直接写 PostgreSQL；交易与结算数据由对应业务服务写入
+- `merged_tick_l2_*` 作为合并原始行事实表，由归档服务消费 `md.tick.merged.*` 写入
 - 采用 PostgreSQL 声明式分区（逻辑仍是一张表）
 
 ### 8.2 Redis（实时态）
@@ -268,6 +300,7 @@
 
 - 行情延迟
 - 原始行情发布延迟（`md.tick.raw.<product_id>`）
+- 合并原始行发布延迟（`md.tick.merged.<product_id>`）
 - 归档服务入库延迟与失败率
 
 ### 10.2 交易链路
@@ -309,9 +342,21 @@
 - `order_timeout_ms`
 - `signal_ttl_ms`
 - `max_cancel_attempts`
-- `factor_window_seconds=400`
+- `raw_market_cache_minutes=5`
+- `raw_market_cache_seconds=300`
 - `factor_cache_rows=400`
+- `factor_precalc_semantic=step4.aggregate_by_minute.v2`
+- `factor_precalc_interval_parser=step4.interval_to_seconds`
+- `factor_calculator_module=MacroHFT_Features_SH.src.gen.feature_calculator`
+- `factor_feature_list_by_product`
+- `factor_feature_list_by_product` 示例：`{"al":["wap_balance","price_spread"],"fu":["imbalance_top3","volatility_60"]}`
+- `factor_feature_list_strict=true`
+- `factor_switch_reset_mode=full_flush`
+- `factor_warmup_min_units=1`
+- `raw_cache_evict_requires_calculated=true`
 - `md_subject_pattern=md.tick.raw.{product_id}`
+- `md_merged_subject_pattern=md.tick.merged.{product_id}`
+- `contract_plan_subject_pattern=contract.plan.generated.{product_id}`
 - `factor_archive_subject_pattern=factor.unit.calculated.{product_id}`
 - `md_product_shard_subscriptions`
 - `market_collector_publish_buffer`

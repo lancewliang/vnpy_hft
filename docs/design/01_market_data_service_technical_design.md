@@ -39,6 +39,8 @@
 
 - 归档服务：消费 `md.tick.raw.*` 并落库
 - 决策流水线：按 `product_id` 消费原始行情；其中因子模块计算因子并在进程内直接调用策略模块
+- 决策流水线缓存规则：原始行情缓存中未参与因子计算的数据不得淘汰
+- 决策流水线切换规则：当 `contract.plan.generated.<product_id>` 生效且合约集合变化时，因子模块全量清空缓存并进入预热后再恢复决策
 
 ## 3. 与 vn.py 的对接定位
 
@@ -122,6 +124,7 @@ flowchart LR
 - 将 `TickData` 原样封装为可传输消息
 - 增加最小元数据（`event_id`、`received_at`、`gateway_name`）
 - 基于订阅管理中的 `instrument_id -> product_id` 映射生成主题后缀
+- 映射规则：`product_id` 由 `instrument_id` 去掉末尾数字得到（如 `rb2610 -> rb`、`IF2606 -> IF`）
 - 按规则路由：`subject = md.tick.raw.{product_id}`
 
 约束：
@@ -237,10 +240,11 @@ sequenceDiagram
 
 ### 9.4 次交易日订阅切换
 
-- 输入：`contract.plan.generated`（包含 `effective_trading_day`、`cutover_time`、`product_id -> [instrument_id...]`）
+- 输入：`contract.plan.generated.<product_id>`（包含 `effective_trading_day`、`cutover_time`、`product_id`、`instrument_id[]`）
 - 流程：预加载次日订阅集 -> 到达切换时刻 -> 先增量订阅新集合 -> 确认后取消旧集合
 - 目标：切换过程不中断服务进程，避免跨日人工重启
 - 默认规则：每个 `product_id` 的订阅集合为成交量前4主力合约
+- 下游协同：决策流水线同步消费对应 `contract.plan.generated.<product_id>`，若集合变化则执行全量缓存清空和预热闸门
 
 ## 10. 部署规范
 
@@ -298,6 +302,7 @@ sequenceDiagram
 - `reconnect_backoff_ms`
 - `heartbeat_interval_sec`
 - `subscription_plan_source`
+- `subscription_plan_subject_pattern=contract.plan.generated.{product_id}`
 - `subscription_effective_field=effective_trading_day`
 - `subscription_cutover_field=cutover_time`
 - `subscription_top_n_default=4`
