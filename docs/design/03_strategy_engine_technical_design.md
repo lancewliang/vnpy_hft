@@ -5,7 +5,7 @@
 定义 `vnpy_hft` 策略模块的可实现技术方案，覆盖：
 
 - 通过进程内接口接收因子模块回调
-- 直接复用因子模块维护的最近 `400` 行因子缓存
+- 消费由因子模块组装的 `FactorDecisionContext`（包含 `ArchetypeTrader` 决策输入所需字段）
 - 接入 `ArchetypeTrader` 决策逻辑
 - 执行前置闸门校验并输出交易信号
 - 支撑按 `product_id` 的同进程部署、状态恢复与信号时效控制
@@ -26,9 +26,9 @@
 
 - 接收因子模块的进程内回调
 - 管理策略运行上下文：持仓、活动委托状态、行情新鲜度、风控放行状态
-- 读取当前因子值和最近 `400` 行因子缓存
+- 读取并校验 `FactorDecisionContext` 的完整性（市场状态 + archetype 上下文 + 外部状态）
 - 在满足闸门条件时运行策略逻辑
-- 发布 `strategy.signal`
+- 发布 `strategy.signal.<product_id>`
 
 ### 2.2 策略模块不负责
 
@@ -40,9 +40,9 @@
 
 ### 2.3 相关模块职责
 
-- 因子模块：计算因子、维护最近 `400` 行因子缓存，并通过内存直接调用策略模块
-- 归档服务：消费 `factor.unit.calculated.*` 并写入 `factor_unit_*`
-- 执行服务：消费 `strategy.signal` 并发单
+- 因子模块：计算因子并组装 `FactorDecisionContext`，通过内存直接调用策略模块
+- 归档服务：消费 `strategy.signal.*` 做信号归档，并消费 `factor.unit.calculated.*` 写入 `factor_unit_*`
+- 执行服务：消费 `strategy.signal.*` 并发单
 - 风控服务：给出事前风控结论
 - `vnpy` 执行底座：通过 `OmsEngine` 提供持仓、活动委托、成交等实时状态语义参考
 
@@ -67,11 +67,11 @@
 ### 4.1 输入
 
 - In-Process：`FactorEngine.run_strategy(context)`
-- 同步查询接口：当前持仓、活动委托、风控参数、最新账户状态
+- 同步查询接口：当前持仓、活动委托、风控参数、最新账户状态（用于补齐 `FactorDecisionContext.external_state`）
 
 ### 4.2 输出
 
-- JetStream：`strategy.signal`
+- JetStream：`strategy.signal.<product_id>`
 
 ### 4.3 依赖
 
@@ -112,8 +112,8 @@ flowchart LR
 职责：
 
 - 接收因子模块传入的 `FactorDecisionContext`
-- `FactorDecisionContext` 由 `FactorWindowContext + 当前因子结果 + 因子缓存快照` 组装而成
-- 读取当前因子值与最近 `400` 行因子缓存
+- `FactorDecisionContext` 基础字段由因子服务（特征服务）组装并传入
+- 在进入模型前补齐 `external_state`（持仓/活动委托/风控）字段
 - 作为策略计算的唯一触发入口
 
 ### 6.2 Pre-Trade Gate
@@ -139,8 +139,8 @@ flowchart LR
 职责：
 
 - 对接 `ArchetypeTrader` 中迁移后的在线推断逻辑
-- 将当前因子、最近 `400` 行因子缓存、`FactorWindowContext`（区间内全部原始数据行）、持仓状态组装为模型输入
-- 输出目标信号或目标仓位
+- 将完整 `FactorDecisionContext` 作为模型唯一输入（含 `s_ref1`、`s_ref2` 与外部状态）
+- 输出交易动作信号（`BUY/SELL/HOLD`）
 
 要求：
 
@@ -152,19 +152,35 @@ flowchart LR
 职责：
 
 - 生成统一信号对象
-- 计算 `generated_at`、`expire_at`、`cycle_id`
+- 计算 `generated_at`、`expire_at`、`cycle_id`、`decision_ts`、`decision_batch_no`
 - 将目标动作转换为执行层可理解的信号结构
 
 ### 6.5 Signal Publisher
 
 职责：
 
-- 发布 `strategy.signal`
+- 发布 `strategy.signal.<product_id>`
 
 要求：
 
 - 信号必须包含时效控制字段
 - 发布采用 at-least-once，下游执行层做幂等
+- 信号发布后应可被执行服务与归档服务同时消费
+
+### 6.6 Oms State Consistency Guard
+
+职责：
+
+- 维护 `last_decision_ts` 与 `last_decision_batch_no`
+- 对齐 `OmsEngine` 侧状态水位（时间戳与批次号）
+- 防止“策略决策状态”与“执行状态”发生双边漂移
+
+规则：
+
+- 每次决策后单调递增 `decision_batch_no`
+- 发布下一条信号前校验 `OmsEngine` 状态是否至少追平到上一次决策批次
+- 若发现状态不一致（时间戳或批次号落后/冲突），进入“状态修复”流程并暂停新信号发布
+- 状态修复算法与回放细节待后续专项设计，本版先固定接口与约束
 
 ## 7. 核心业务机制
 
@@ -178,8 +194,9 @@ flowchart LR
 ### 7.2 周期与幂等
 
 - 每次策略运行分配唯一 `cycle_id`
+- 每次策略运行生成单调递增 `decision_batch_no`
 - 相同 `instrument_id + factor_time_interval + unit_end_ts + strategy_id` 只允许产出一组有效信号
-- 若因重试重复进入，需利用 `cycle_id` 做信号去重
+- 若因重试重复进入，需利用 `cycle_id + decision_batch_no` 做信号去重
 
 ### 7.3 信号时效
 
@@ -197,18 +214,76 @@ flowchart LR
 
 - 当 `product_id` 的合约集合发生切换时，策略模块必须等待因子模块预热完成
 - 预热完成判定：新合约集合内每个 `instrument_id` 的因子缓存行数达到 `factor_cache_rows`
-- 预热完成前不发布任何 `strategy.signal`
+- 预热完成前不发布任何 `strategy.signal.<product_id>`
 - 预热完成后按新 `instrument_id` 集合恢复周期触发
+
+### 7.6 状态一致性闸门（策略侧 vs OmsEngine）
+
+- 策略服务必须维护并持久化最近一次决策水位：`last_decision_ts`、`last_decision_batch_no`
+- 每轮决策前，读取 `OmsEngine` 可观测状态水位并进行比较
+- 若 `OmsEngine` 水位落后于策略最近决策水位，阻断新信号并触发状态修复
+- 若时间戳顺序与批次号顺序冲突，按“时间戳 + 批次号”联合判定进入修复流程
+- 修复算法（重放范围、冲突优先级）待后续专题设计，本版仅定义触发条件与阻断策略
 
 ## 8. 事件模型
 
-### 8.1 `strategy.signal`
+### 8.1 `FactorDecisionContext`（In-Process）
+
+`FactorDecisionContext` 是策略入模前的统一输入载体：
+
+- 基础字段由因子服务（特征服务）在区间闭合后生成
+- 外部状态字段由策略入口在同周期补齐（持仓/活动委托/风控）
+- 不再在该结构中放入 `factor_cache` 快照字段
+
+字段定义：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `context_id` | `string` | 上下文唯一标识 |
+| `product_id` | `string` | 品种标识 |
+| `instrument_id` | `string` | 合约标识 |
+| `vt_symbol` | `string` | `instrument_id.exchange` |
+| `trading_day` | `date` | 交易日 |
+| `factor_time_interval` | `string` | 因子时间区间（如 `20s`） |
+| `unit_start_ts` | `timestamptz` | 本次区间起始时间 |
+| `unit_end_ts` | `timestamptz` | 本次区间结束时间 |
+| `market_state_vector` | `list<float>` | `s_ref1`：当前步市场状态向量（ArchetypeTrader 输入） |
+| `market_state_schema` | `list<string>` | `market_state_vector` 字段顺序定义，保证训练/推理一致 |
+| `selection_state_vector` | `list<float>` | horizon 起点状态（用于 SelectionAgent 选 archetype） |
+| `archetype_index` | `int` | `a_sel`：SelectionAgent 选择的 archetype 索引 |
+| `archetype_embedding` | `list<float>` | `e_a_sel`：codebook embedding 向量 |
+| `base_action_current` | `int` | `a_base`：当前步 base action（取值 `0/1/2`） |
+| `base_action_prev` | `int` | `a_base_prev`：上一步 base action（PolicyAdapter 输入） |
+| `cumulative_reward_raw` | `float` | `R_arche`：当前 horizon 累积收益（原始值） |
+| `notional_base` | `float` | 归一化分母 `m * p0` |
+| `normalized_reward` | `float` | `R_arche / notional_base`（Refinement 上下文输入） |
+| `horizon_steps` | `int` | `h`：当前 horizon 总步数 |
+| `step_idx_in_horizon` | `int` | 当前步索引 `step_idx` |
+| `tau_remain` | `float` | `(h - step_idx) / h`（Refinement 上下文输入） |
+| `has_adjusted_in_horizon` | `bool` | 当前 horizon 是否已执行一次非零调整 |
+| `external_state.position_snapshot` | `object` | 持仓快照（`position_qty`、`position_ts`、`avg_hold_price`、`cash`、`total_value`） |
+| `external_state.active_order_snapshot` | `object` | 活动委托快照（`has_active_orders`、`active_order_count`、`active_order_ts`、`order_state_version`） |
+| `external_state.risk_snapshot` | `object` | 风控快照（`risk_passed`、`risk_check_ts`、`risk_version`、`reject_reason`） |
+| `gate_inputs` | `object` | 闸门输入快照（`no_active_orders`、`position_fresh`、`market_fresh`、`risk_passed`） |
+| `contract_switch_phase` | `string` | `normal/warmup`，用于策略闸门 |
+| `decision_watermark` | `object` | 状态一致性水位（`last_decision_ts`、`last_decision_batch_no`、`oms_state_ts`、`oms_batch_no`） |
+| `generated_at` | `timestamptz` | 上下文生成时间 |
+
+字段来源对齐说明：
+
+- `s_ref1` 与 `s_ref2=[e_a_sel, a_base, normalized_reward, tau_remain]` 对齐 `ArchetypeTrader/src/evaluation/inference_runner.py`
+- `SelectionAgent` 输入 `selection_state_vector` 对齐 `ArchetypeTrader/src/phase2/selection_agent.py`
+- `PolicyAdapter` 依赖 `a_base/a_base_prev/has_adjusted` 对齐 `ArchetypeTrader/src/phase3/policy_adapter.py`
+
+### 8.2 `strategy.signal.<product_id>`
 
 ```json
 {
   "event_id": "01J...",
   "event_type": "strategy.signal.v1",
   "cycle_id": "rb2610-20260426-093020-01",
+  "decision_batch_no": 1024,
+  "decision_ts": "2026-04-26T09:30:20.110+08:00",
   "strategy_id": "arch_trader_v1",
   "strategy_version": "v1",
   "product_id": "rb",
@@ -218,11 +293,21 @@ flowchart LR
   "unit_end_ts": "2026-04-26T09:30:20+08:00",
   "generated_at": "2026-04-26T09:30:20.120+08:00",
   "expire_at": "2026-04-26T09:30:20.620+08:00",
-  "signal_type": "target_position",
-  "target_position": 2,
+  "signal_action": "BUY",
   "reason": "factor_score_positive_breakout"
 }
 ```
+
+`signal_action` 枚举值：
+
+- `BUY`：买入
+- `SELL`：卖出
+- `HOLD`：保持不动
+
+消费方：
+
+- 执行服务消费 `strategy.signal.*` 并执行下单/撤单流程
+- 归档服务消费 `strategy.signal.*` 并做信号落库归档
 
 ## 9. 关键时序
 
@@ -233,14 +318,15 @@ sequenceDiagram
     participant SE as Strategy Engine
     participant QA as Query API
     participant MQ as JetStream
+    participant AS as Archive Service
     participant OMS as Execution Service
 
     FE->>SE: run_strategy(context)
     SE->>QA: query positions/active orders/risk state
-    SE->>FE: read last 400 factor rows from memory cache
-    SE->>SE: gate check + run strategy
-    SE->>MQ: publish strategy.signal
-    MQ-->>OMS: consume strategy.signal
+    SE->>SE: fill context.external_state + gate check + run strategy
+    SE->>MQ: publish strategy.signal.<product_id>
+    MQ-->>OMS: consume strategy.signal.*
+    MQ-->>AS: consume strategy.signal.*
 ```
 
 ## 10. 一致性与恢复
@@ -248,13 +334,13 @@ sequenceDiagram
 ### 10.1 幂等
 
 - 事件幂等键：`event_id`
-- 决策幂等键：`strategy_id + instrument_id + factor_time_interval + unit_end_ts + cycle_id`
+- 决策幂等键：`strategy_id + instrument_id + factor_time_interval + unit_end_ts + cycle_id + decision_batch_no`
 
 ### 10.2 重启恢复
 
 - 启动时绑定因子模块的内存缓存与回调接口
 - 不直接从 PostgreSQL 读取因子历史，也不从 Redis 恢复因子缓存
-- 恢复期不发布信号，直到因子模块的最近 `400` 行因子缓存装载完成
+- 恢复期不发布信号，直到因子模块预热完成并可持续输出完整 `FactorDecisionContext`
 
 ### 10.3 异常处理
 
@@ -262,6 +348,14 @@ sequenceDiagram
 - 持仓状态过旧：跳过本轮决策
 - 策略推理失败：记录错误并丢弃本轮周期
 - 因子模块预热未完成：持续跳过决策并输出告警
+- 状态水位不一致：暂停信号发布并进入状态修复流程
+
+### 10.4 状态修复机制（预留）
+
+- 触发条件：`OmsEngine` 状态时间戳或批次号落后于 `last_decision_ts/last_decision_batch_no`
+- 修复输入：`last_decision_ts`、`last_decision_batch_no`、`OmsEngine` 当前状态水位
+- 修复目标：使 `OmsEngine` 状态对齐到“最近一次有效决策批次”
+- 实现说明：具体修复算法待后续设计评审，本版仅固化接口与流程占位
 
 ## 11. 部署规范
 
@@ -286,21 +380,24 @@ sequenceDiagram
 
 ## 12. 配置项
 
-| 配置项 | 默认值/示例 | 含义 |
-| --- | --- | --- |
-| `strategy_trigger_mode` | `inprocess` | 策略触发模式，固定为因子模块进程内回调 |
-| `signal_ttl_ms` | `500` | 信号有效期（毫秒），过期后禁止下发 |
-| `market_freshness_threshold_ms` | `1000` | 行情新鲜度阈值（毫秒） |
-| `position_freshness_threshold_ms` | `1000` | 持仓新鲜度阈值（毫秒） |
-| `strategy_query_api_endpoint` | `http://...` | 持仓/活动委托状态查询接口地址 |
-| `strategy_id` | `archetype_v1` | 策略标识 |
-| `strategy_version` | `v1` | 策略版本 |
-| `max_cycle_retry` | `3` | 单周期最大重试次数 |
-| `strategy_wait_factor_warmup` | `true` | 是否等待因子预热完成后再触发策略 |
+| 配置项 | 默认值/示例 | 含义 | 备注 |
+| --- | --- | --- | --- |
+| `strategy_trigger_mode` | `inprocess` | 策略触发模式，固定为因子模块进程内回调 | - |
+| `factor_cache_rows` | `400`（示例） | 合约切换预热达标阈值 | 由因子服务统一配置，不限定为 `400` |
+| `signal_ttl_ms` | `500` | 信号有效期（毫秒），过期后禁止下发 | - |
+| `market_freshness_threshold_ms` | `1000` | 行情新鲜度阈值（毫秒） | - |
+| `position_freshness_threshold_ms` | `1000` | 持仓新鲜度阈值（毫秒） | - |
+| `strategy_query_api_endpoint` | `http://...` | 持仓/活动委托状态查询接口地址 | - |
+| `strategy_signal_subject_pattern` | `strategy.signal.{product_id}` | 信号发布主题模板 | 执行与归档均消费该主题 |
+| `strategy_id` | `archetype_v1` | 策略标识 | - |
+| `strategy_version` | `v1` | 策略版本 | - |
+| `max_cycle_retry` | `3` | 单周期最大重试次数 | - |
+| `strategy_wait_factor_warmup` | `true` | 是否等待因子预热完成后再触发策略 | - |
 
 说明：
 
 - `factor_time_interval` 由因子服务统一配置并随回调上下文传入，策略服务不再重复配置。
+- `factor_cache_rows` 仅用于预热达标判断；`FactorDecisionContext` 不包含因子缓存快照。
 
 ## 13. 可观测性与告警
 
@@ -312,25 +409,31 @@ sequenceDiagram
 - `strategy_inference_latency_ms_p95/p99`
 - `strategy_signal_publish_fail_rate`
 - `strategy_signal_expired_before_execution`
+- `strategy_oms_state_mismatch_total`
+- `strategy_state_reconcile_duration_ms`
 
 ### 13.2 告警
 
-- `Warning`：闸门拒绝率异常升高、推理延迟升高
-- `Critical`：连续信号发布失败、周期停滞、状态恢复失败
+- `Warning`：闸门拒绝率异常升高、推理延迟升高、状态修复耗时升高
+- `Critical`：连续信号发布失败、周期停滞、状态恢复失败、状态水位长期不一致
 
 ## 14. 测试与验收
 
 ### 14.1 单元测试
 
-- 因子模块回调与最近 `400` 行因子缓存读取逻辑
+- 因子模块回调与 `FactorDecisionContext` 字段完整性校验逻辑
 - 闸门规则正确性
 - 信号时效字段生成正确性
+- `signal_action` 枚举值（`BUY/SELL/HOLD`）合法性
+- `decision_batch_no` 单调递增与去重逻辑
 
 ### 14.2 集成测试
 
-- 接收因子模块回调并生成 `strategy.signal`
+- 接收因子模块回调并生成 `strategy.signal.<product_id>`
 - 无活动委托/有活动委托两类周期行为验证
 - 风控阻断与持仓过旧场景验证
+- 执行服务与归档服务并行消费 `strategy.signal.*` 验证
+- `OmsEngine` 状态水位不一致触发修复流程验证
 
 ### 14.3 验收门槛
 

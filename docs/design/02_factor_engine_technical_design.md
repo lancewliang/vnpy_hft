@@ -228,7 +228,7 @@ flowchart LR
 
 - 在因子结果完成后组装 `FactorDecisionContext`
 - 通过进程内函数调用直接触发策略模块计算
-- 传递当前因子值、最近 `400` 行因子缓存和必要窗口元数据（含 `raw_market_cache_seconds`）
+- 传递完整决策输入结构：市场状态向量、archetype 上下文、窗口元数据与外部状态占位（不包含 `factor_cache` 快照）
 
 ### 6.8 Archive Event Publisher
 
