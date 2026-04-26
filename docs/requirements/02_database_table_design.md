@@ -10,10 +10,11 @@
 - 高频核心表采用“实时表 + 历史表”双表设计
 - 日终归档：每天下午收盘后执行，从实时库归档到历史库
 - 不使用 `bar` 数据表，行情基准仅为 `md_tick_l2`
-- 因子由 `tick_l2` 聚合得到（`1` 行因子 = `x` 秒窗口结果）
+- 因子由 `tick_l2` 聚合得到（`1` 行因子 = `1` 个 `factor_time_interval` 区间结果）
 - 行情服务（Market Collector）不直接写库，仅发布 `md.tick.raw.<product_id>`
-- 行情归档服务（Market Archive Service）消费 `md.tick.raw.*` 并写入 `md_tick_l2_*`
-- `unit_seconds` 窗口闭合由因子服务和策略服务各自维护，`factor_unit_*` 由因子服务写入
+- 归档服务（Archive Service）消费 `md.tick.raw.*` 并写入 `md_tick_l2_*`
+- 因子服务发布 `factor.unit.calculated.<product_id>`，归档服务消费后写入 `factor_unit_*`
+- `factor_time_interval` 区间闭合由因子服务维护，策略模块通过进程内调用直接复用闭合结果
 
 ## 2. 表空间与命名规范
 
@@ -48,7 +49,7 @@
 ## 3. 高频双表清单（实时 + 历史）
 
 - `md_tick_l2_rt` / `md_tick_l2_his`：秒级五档行情
-- `factor_unit_rt` / `factor_unit_his`：单位行情因子
+- `factor_unit_rt` / `factor_unit_his`：按 `factor_time_interval` 聚合的因子结果
 - `order_submit_rt` / `order_submit_his`：下单记录
 - `cancel_request_rt` / `cancel_request_his`：撤单记录（多次撤单多行）
 - `trade_fill_rt` / `trade_fill_his`：成交记录
@@ -58,7 +59,7 @@
 - 上述 5 组表同构（字段一致、约束一致）
 - 实时表用于在线读取和写入
 - 历史表用于全量长期保存
-- 各表写入由对应业务服务负责（行情归档/因子/执行/结算等），非统一由行情服务写入
+- 各表写入由对应业务服务负责（归档/执行/结算等），非统一由行情服务写入
 
 ## 4. 高频双表结构（同构定义）
 
@@ -68,7 +69,7 @@
 
 - 全量保存秒级五档行情
 - 因子输入的唯一行情来源（不依赖 bar）
-- 写入主体：行情归档服务（消费 `md.tick.raw.*`）
+- 写入主体：归档服务（消费 `md.tick.raw.*`）
 
 建议字段：
 
@@ -103,9 +104,9 @@
 
 用途：
 
-- 因子结果表，`1` 行 = `x(unit_seconds)` 秒窗口结果
+- 因子结果表，`1` 行 = `1` 个 `factor_time_interval` 区间结果
 - 数据来源为 `md_tick_l2_*`，不是 bar 数据
-- 写入主体：因子服务（因子侧 `unit_seconds` 窗口闭合触发计算）
+- 写入主体：归档服务（消费 `factor.unit.calculated.*`）
 
 建议字段：
 
@@ -116,9 +117,9 @@
 | exchange | VARCHAR(8) NOT NULL | 交易所 |
 | product_id | VARCHAR(16) NOT NULL | 品种 |
 | instrument_id | VARCHAR(32) NOT NULL | 合约 |
-| unit_seconds | SMALLINT NOT NULL | 窗口秒数（20/30等） |
-| unit_start_ts | TIMESTAMPTZ NOT NULL | 单位窗口开始时间 |
-| unit_end_ts | TIMESTAMPTZ NOT NULL | 单位窗口结束时间 |
+| factor_time_interval | VARCHAR(16) NOT NULL | 因子时间区间，如 `20s`、`30s` |
+| unit_start_ts | TIMESTAMPTZ NOT NULL | 因子时间区间开始时间 |
+| unit_end_ts | TIMESTAMPTZ NOT NULL | 因子时间区间结束时间 |
 | rev_ts | TIMESTAMPTZ NOT NULL | 计算时最新接收时间 |
 | factor_set | VARCHAR(64) NOT NULL DEFAULT 'default' | 因子集合 |
 | factor_version | VARCHAR(32) NOT NULL | 因子版本 |
@@ -128,13 +129,13 @@
 
 约束和索引建议：
 
-- 唯一键：`UNIQUE (instrument_id, unit_seconds, unit_end_ts, factor_set, calc_rev)`
-- 索引：`(trading_day, instrument_id, unit_end_ts)`、`(factor_set, unit_end_ts)`
+- 唯一键：`UNIQUE (instrument_id, factor_time_interval, unit_end_ts, factor_set, calc_rev)`
+- 索引：`(trading_day, instrument_id, unit_end_ts)`、`(factor_set, factor_time_interval, unit_end_ts)`
 - 可选：`GIN (factors_json)`（仅在 JSON 条件检索需要时）
 
 口径规则：
 
-- `x = unit_seconds`
+- `factor_time_interval` 表示每行因子使用多少秒原始数据进行聚合
 - 每行因子使用 `[unit_start_ts, unit_end_ts)` 范围内的 `tick_l2` 聚合计算
 
 ## 4.3 下单表：`order_submit_rt` / `order_submit_his`
@@ -259,7 +260,7 @@
 - 归档失败时不执行清理
 - 归档任务需可重试且幂等
 - 推荐使用 `INSERT INTO ... SELECT ... ON CONFLICT DO NOTHING`
-- 归档流程由行情归档服务（或其调度任务）执行
+- 归档流程由归档服务（或其调度任务）执行
 
 ## 6.2 保留策略
 
@@ -294,7 +295,7 @@
 
 - 下单锚点：`account_id + front_id + session_id + order_ref`
 - 成交锚点：`account_id + trade_id`
-- 因子锚点：`instrument_id + unit_seconds + unit_end_ts + factor_set + calc_rev`
+- 因子锚点：`instrument_id + factor_time_interval + unit_end_ts + factor_set + calc_rev`
 - 入库幂等：`ON CONFLICT DO NOTHING`
 
 ## 10. DDL 落地顺序建议

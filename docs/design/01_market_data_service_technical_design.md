@@ -26,7 +26,7 @@
 - 行情标准化
 - 数据库存储（PostgreSQL）
 - 文件归档（NAS）
-- `unit_seconds` 单位窗口闭合事件生成
+- `factor_time_interval` 区间闭合事件生成
 - 因子计算与策略判定
 
 ### 2.3 轻量化原则
@@ -37,9 +37,8 @@
 
 ### 2.4 相关服务职责
 
-- 行情归档服务：消费 `md.tick.raw.*` 并落库
-- 因子服务：维护自身 `unit_seconds` 窗口并计算因子
-- 策略服务：维护自身 `unit_seconds` 窗口并触发决策
+- 归档服务：消费 `md.tick.raw.*` 并落库
+- 决策流水线：按 `product_id` 消费原始行情；其中因子模块计算因子并在进程内直接调用策略模块
 
 ## 3. 与 vn.py 的对接定位
 
@@ -141,7 +140,7 @@ flowchart LR
 
 - at-least-once
 - 下游按 `event_id` 幂等处理
-- 下游可按 `md.tick.raw.<product_id>` 独立部署消费者实例
+- 下游默认由 `decision-pipeline` 按 `md.tick.raw.<product_id>` 独立部署消费者实例，不同 `product_id` 不得在同一计算实例内混跑
 
 ### 6.5 Health Monitor
 
@@ -204,16 +203,18 @@ sequenceDiagram
     participant CTP as vnpy_ctp
     participant MDS as Market Data Service
     participant MQ as JetStream
-    participant MA as Market Archive Service
+    participant AS as Archive Service
+    participant DP as Decision Pipeline
     participant FE as Factor Engine
     participant SE as Strategy Engine
 
     CTP->>MDS: TickData
     MDS->>MQ: publish md.tick.raw.<product_id>
 
-    MQ-->>MA: consume md.tick.raw.* and archive to DB
-    MQ-->>FE: consume md.tick.raw.<product_id> and manage unit_seconds window
-    MQ-->>SE: consume md.tick.raw.<product_id> and manage unit_seconds window
+    MQ-->>AS: consume md.tick.raw.* and archive to DB
+    MQ-->>DP: consume md.tick.raw.<product_id>
+    DP->>FE: manage factor_time_interval and calculate factors
+    FE->>SE: invoke strategy in-process with memory cache
 ```
 
 ## 9. 一致性与恢复
@@ -275,7 +276,8 @@ sequenceDiagram
 ### 10.5 扩展与分片规则
 
 - 主题分片规则保持为 `md.tick.raw.<product_id>`
-- 因子服务与策略服务按 `product_id` 分配实例订阅对应主题
+- 决策流水线必须按 `product_id` 分配独立实例订阅对应主题
+- 例如 `AL` 与 `FU` 应分别启动 `decision-pipeline-AL` 与 `decision-pipeline-FU`，而不是由同一计算实例同时消费两个主题
 - 行情服务扩容优先按 `product_id` 横向拆分，而不是在单实例内继续堆叠更多品种
 - 若确需混合部署多个品种，应先做订阅数量、发布延迟、断线重连时长的容量测试
 
@@ -349,7 +351,7 @@ sequenceDiagram
 
 3. 第三阶段：切换与联调
 - 完成次交易日订阅切换机制
-- 与归档服务、因子服务、策略服务完成分片订阅联调
+- 与归档服务、决策流水线完成分片订阅联调
 
 ## 15. 关联文档
 
