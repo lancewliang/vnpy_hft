@@ -45,10 +45,14 @@
 - 决策频率：仅在“单位行情完成”时触发（`unit_seconds` 可配置，20/30 秒等）
 - 因子计算口径：因子由最近 `x=unit_seconds` 秒的 1 秒五档行情聚合计算，因子表 `1` 行代表 `x` 秒单位行情结果
 - 因子与策略内存窗口：固定保留最近 `400` 秒 1 秒五档行情，同时保留对应最近 `ceil(400/x)` 行因子结果
+- 行情服务职责边界：仅负责行情接收与消息发布，不负责标准化、窗口聚合和数据库落库
+- 行情主题约束：原始行情发布主题采用 `md.tick.raw.<product_id>`（如 `md.tick.raw.rb`、`md.tick.raw.IF`）
+- 行情落库职责：由独立归档服务消费 `md.tick.raw.*` 后写入 PostgreSQL
+- 单位窗口职责：`unit_seconds` 窗口闭合由因子服务与策略服务各自维护和触发
 - 前置约束：必须满足“当前委托已结束（成交/撤单）+ 持仓新鲜 + 行情新鲜 + 风控通过”后，才允许新一轮策略
 - 信号时效：策略结果带有效期，过期不得下发到执行层
 - 超时委托：需定义超时时间，触发自动撤单
-- 日终要求：交易日下午结束后调用外部结算接口拉取各品种全部合约结算数据，生成结算报告，并计算次交易日订阅合约（默认每个品种选择当日成交量最高合约）
+- 日终要求：交易日下午结束后调用外部结算接口拉取各品种全部合约结算数据，生成结算报告，并计算次交易日订阅合约（默认每个品种选择当日成交量前4主力合约）
 
 ## 3. 技术选型（已定稿）
 
@@ -69,11 +73,11 @@
 
 系统按职责分为 7 个域：
 
-- 行情域：行情接入、标准化、单位行情聚合
+- 行情域：行情接入与原始事件发布
 - 决策域：因子计算、策略判定、信号时效控制
 - 交易域：下单、撤单、成交回报、委托状态机
 - 风控域：事前拦截、事中监控、风险阈值告警
-- 数据域：PostgreSQL 全量落库、Redis 实时态、NAS 归档
+- 数据域：归档服务落库、PostgreSQL 全量存储、Redis 实时态、NAS 归档
 - 结算与订阅规划域：外部接口结算同步、次交易日订阅计划生成
 - 运维域：监控、报警、任务调度
 
@@ -83,29 +87,36 @@
 
 - 代码来源：以 `vnpy` 行情接入能力为基础，统一接入 `vnpy_hft` 事件总线
 - 通过 `vnpy_ctp` 接收行情
-- 标准化字段（交易所、品种、合约、`ts`、`rev_ts`、五档盘口）
-- 发布原始行情事件
-- 写入 PostgreSQL 行情表（append-only）
-- 生成单位行情（20s/30s 等可配置）
+- 发布原始行情事件到 `md.tick.raw.<product_id>`
+- 轻量化原则：仅做接收、编码、发布与订阅切换，不承载业务计算和存储
+- 不负责行情标准化、单位窗口聚合与数据库落库
+- 支持次交易日按订阅计划热切换合约（不重启服务）
 
-### 5.2 因子服务（Factor Engine）
+### 5.2 行情归档服务（Market Archive Service）
+
+- 独立消费 `md.tick.raw.*` 原始行情事件
+- 负责行情标准化与幂等处理
+- 写入 PostgreSQL 行情表（append-only）
+- 执行实时库与历史库归档策略，输出 NAS 文件归档
+
+### 5.3 因子服务（Factor Engine）
 
 - 代码来源：主要移植 `MacroHFT_Features_SH` 因子工程代码，并改造为在线计算服务
 - 因子计算口径：`x = unit_seconds`，每个因子行由最近 `x` 秒（1 秒五档行情）聚合计算
 - 维护内存窗口：固定 `400` 秒原始五档行情窗口 + 对应 `ceil(400/x)` 行因子窗口
-- 在单位行情完成时计算因子
+- 由因子服务自身维护 `unit_seconds` 窗口闭合，并在窗口完成时计算因子
 - 写入因子表（每单位行情一行）
-- 发布因子计算完成事件
+- 发布 `factor.unit.window.close`、`factor.unit.calculated` 事件
 
-### 5.3 策略服务（Strategy Engine）
+### 5.4 策略服务（Strategy Engine）
 
 - 代码来源：主要移植 `ArchetypeTrader` 策略决策代码，并适配实盘调度与风控闸门
 - 每秒触发一次调度检查
-- 仅在单位行情完成时进行策略判定
+- 维护策略侧 `unit_seconds` 窗口闭合，仅在窗口完成时进行策略判定
 - 判定前检查闸门：无活动委托、持仓快照版本有效、行情新鲜、风控通过
-- 输出策略信号（含 `generated_at`、`expire_at`、`cycle_id`）
+- 输出策略信号（含 `generated_at`、`expire_at`、`cycle_id`），可发布 `strategy.unit.window.close`
 
-### 5.4 执行服务（OMS/Execution）
+### 5.5 执行服务（OMS/Execution）
 
 - 代码来源：以 `vnpy` 交易执行与委托回报机制为底座，在 `vnpy_hft` 中增强超时与状态管理
 - 接收策略信号并校验有效期
@@ -115,14 +126,14 @@
 - 记录多次撤单尝试
 - 记录成交明细
 
-### 5.5 风控服务（Risk Service）
+### 5.6 风控服务（Risk Service）
 
 - 事前风控：下单前限制（仓位、风险敞口、限价偏离等）
 - 事中风控：委托超时、撤单失败、成交异常
 - 事后风控：日终风险归因
 - 输出风险事件和告警事件
 
-### 5.6 调度与结算服务（Scheduler & Settlement）
+### 5.7 调度与结算服务（Scheduler & Settlement）
 
 - 日内调度（1 秒 tick）
 - 日终调度（收盘后结算任务）
@@ -130,18 +141,19 @@
 - 生成每日结算报告
 - 触发次交易日订阅规划任务
 
-### 5.7 订阅规划服务（Contract Subscription Planner）
+### 5.8 订阅规划服务（Contract Subscription Planner）
 
 - 读取日终结算同步结果
 - 按品种对合约成交量排名
-- 默认规则：每个品种选择当日成交量最高合约作为次交易日主订阅合约
-- 输出并持久化次交易日订阅计划
+- 默认规则：每个品种选择当日成交量前4合约作为次交易日主订阅合约池
+- 输出并持久化次交易日订阅计划（含 `effective_trading_day`、`cutover_time`）
 - 将订阅计划发布给行情采集与策略服务（次交易日生效）
 
-### 5.8 监控告警服务（Observability）
+### 5.9 监控告警服务（Observability）
 
 - 服务可用性、队列积压、处理延迟
 - 行情延迟与数据新鲜度
+- 归档服务落库延迟与失败率
 - 下单成功率、撤单成功率、拒单率
 - 风控触发频率与关键告警升级
 
@@ -151,9 +163,11 @@
 
 建议主题（subject）：
 
-- `md.tick.raw`：原始秒级行情
-- `md.unit.window.close`：单位窗口完成事件（由 tick_l2 聚合）
+- `md.tick.raw.<product_id>`：原始秒级行情（按品种分片）
+- `md.tick.archived`：行情归档写库完成事件
+- `factor.unit.window.close`：因子服务单位窗口完成事件
 - `factor.unit.calculated`：因子结果
+- `strategy.unit.window.close`：策略服务单位窗口完成事件
 - `strategy.signal`：策略信号
 - `order.submit`：下单请求
 - `order.cancel`：撤单请求
@@ -175,6 +189,7 @@
 - 语义：`at-least-once`
 - 幂等键：`event_id`、`order_ref`、`trade_id`、`cycle_id`
 - 顺序性建议：行情按 `instrument_id` 保序，交易按 `account_id` 保序
+- 扩展建议：因子和策略服务可按 `product_id` 订阅 `md.tick.raw.<product_id>`，实现多实例分片消费
 
 ## 7. 核心业务机制
 
@@ -205,15 +220,16 @@
 
 - 因子单位为 `x` 秒，`x` 由 `unit_seconds` 配置决定
 - 每个 `factor_unit` 行对应一个单位窗口区间（`unit_start_ts` 到 `unit_end_ts`）
-- 因子计算与策略判定共享同一份 1 秒五档行情窗口
+- 因子服务与策略服务均消费 `md.tick.raw.<product_id>` 并各自维护窗口闭合
 - 内存窗口固定覆盖最近 `400` 秒原始行情，对应保留 `ceil(400/x)` 行因子结果
 
 ### 7.6 日终结算与次交易日订阅
 
 - 每日下午收盘后调度器调用外部结算接口，拉取“按品种全合约”结算与成交量
 - 对每个品种按当日成交量降序排名
-- 默认选取每个品种成交量第一的合约，作为次交易日订阅合约
+- 默认选取每个品种成交量前4的合约，作为次交易日订阅合约池
 - 生成订阅计划后发布事件并持久化，供次交易日开盘前加载
+- 行情采集服务在 `effective_trading_day` 到达时按 `cutover_time` 原子切换订阅合约
 
 ## 8. 数据存储策略
 
@@ -221,6 +237,7 @@
 
 - 保存全量数据
 - 逻辑上 append-only（只插入，不更新）
+- 行情数据由行情归档服务写入；交易与结算数据由对应业务服务写入
 - 采用 PostgreSQL 声明式分区（逻辑仍是一张表）
 
 ### 8.2 Redis（实时态）
@@ -229,7 +246,7 @@
 
 ### 8.3 NAS（归档）
 
-- 定期从 PostgreSQL 导出归档文件
+- 由归档服务定期从 PostgreSQL 导出归档文件
 - 行情优先导出 `CSV`
 - 回放读取归档文件，而非 PostgreSQL
 
@@ -246,8 +263,8 @@
 ### 10.1 数据质量
 
 - 行情延迟
-- 单位行情生成延迟
-- 数据入库失败率
+- 原始行情发布延迟（`md.tick.raw.<product_id>`）
+- 归档服务入库延迟与失败率
 
 ### 10.2 交易链路
 
@@ -274,6 +291,9 @@
 - 关键顺序通道按 `account_id` 分片，避免账户级竞态
 - 行情与因子可按 `instrument_id` 水平扩展
 - 生产环境建议主备部署 PostgreSQL 与 NATS
+- 行情服务默认部署规范：`1 collector instance -> 1 product_id -> 前4主力合约`
+- `vnpy` 技术上支持单实例订阅多个品种多个合约，但生产环境不建议作为默认方案
+- 多品种混合订阅仅建议在开发、联调或低流量场景使用，正式上线前需完成容量压测
 
 ## 12. 配置项清单（建议纳入配置中心）
 
@@ -283,11 +303,18 @@
 - `signal_ttl_ms`
 - `max_cancel_attempts`
 - `factor_window_seconds=400`
+- `md_subject_pattern=md.tick.raw.{product_id}`
+- `md_product_shard_subscriptions`
+- `market_collector_publish_buffer`
+- `market_collector_reconnect_backoff_ms`
+- `subscription_cutover_time`
+- `archive_writer_batch_rows`
+- `archive_writer_batch_ms`
 - `market_freshness_threshold_ms`
 - `position_freshness_threshold_ms`
 - `settlement_run_time`
 - `settlement_api_endpoint`
 - `contract_selection_metric=volume`
-- `contract_selection_top_n=1`
+- `contract_selection_top_n=4`
 - `archive_export_cron`
 - `archive_nas_path`
