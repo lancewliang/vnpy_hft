@@ -9,8 +9,8 @@
 - 通过 `vnpy_ctp` 发单并管理委托生命周期
 - 处理成交回报、超时撤单与重试
 - 维护“活动委托 + 持仓 + 决策水位”运行状态
-- 当前版本仅支持“全买/全卖”执行语义，不做算法拆单
-- 写入执行主事实表：`order_submit_*`、`cancel_request_*`、`trade_fill_*`
+- 当前版本支持 `BUY/SELL/HOLD` 信号：`BUY/SELL` 为全仓执行语义，`HOLD` 为 no-op
+- 写入执行主事实表：`order_submit_*`、`order_state_event_*`、`cancel_request_*`、`trade_fill_*`、`position_snapshot_*`
 - 对外提供状态查询接口给策略服务使用
 
 本服务是“信号到交易动作”的执行层，不承担因子计算与策略推理。
@@ -21,9 +21,11 @@
 
 - 订阅并消费 `strategy.signal.<product_id>`
 - 校验 `expire_at`、`cycle_id`、`decision_batch_no` 等关键字段
-- 将 `BUY/SELL` 信号转换为“全仓目标”委托计划
+- 将 `BUY/SELL/HOLD` 信号转换为执行意图（`HOLD` 不生成新委托）
 - 执行下单、撤单、超时控制与撤单重试
 - 处理委托回报、成交回报并更新状态
+- 当同一 `product_id` 存在未终态委托时，阻断该品种 `BUY/SELL` 新信号执行
+- 当未终态委托持续超过阈值时，升级告警给管理员
 - 维护活动委托状态机和持仓快照
 - 将执行事实写入 PostgreSQL
 - 发布执行事件（可选）供监控与审计消费
@@ -40,7 +42,7 @@
 
 - 策略服务：发布 `strategy.signal.<product_id>`
 - 风控服务：提供事前校验结果（或同步风控查询）
-- 归档服务：消费执行事件（可选）做审计级归档
+- 归档服务：消费 `strategy.signal.*` 并写入 `strategy_signal_*`（当前优先 `BUY/SELL`，`HOLD` 后续扩展），消费执行事件（可选）做审计级归档
 - `vnpy` 底座：`MainEngine` + `OmsEngine` + `CtpGateway` 提供交易执行与回报语义
 
 ## 3. 与 vn.py 的对接定位
@@ -64,6 +66,35 @@
 - 委托若长期未成交，会持续停留在活动状态（`SUBMITTING/NOTTRADED/PARTTRADED`）直到收到成交、撤销或拒单回报。
 - 因此“保证成交”必须由执行策略实现（超时撤单、改价重发、风控降级等），不是 `vnpy` 内核默认保证。
 
+### 3.1 `vnpy` 回调事件含义（执行服务关注）
+
+| 事件 | 来源 | 含义 | 本服务动作 |
+| --- | --- | --- | --- |
+| `EVENT_ORDER` | 网关委托回报 | 委托状态变化（提交中/未成交/部分成交/全部成交/已撤销/拒单） | 更新订单状态机，写入 `order_state_event_*` |
+| `EVENT_TRADE` | 网关成交回报 | 一笔真实成交事实 | 写入 `trade_fill_*`，并触发持仓更新流程 |
+| `EVENT_POSITION` | 网关持仓回报 | 持仓快照变化（数量、昨仓、冻结、均价、盈亏） | 写入 `position_snapshot_*`，刷新策略查询态 |
+| `EVENT_ACCOUNT` | 网关账户回报 | 资金与可用余额变化 | 更新资金快照（可选持久化） |
+
+说明：
+
+- 执行服务主状态机以 `EVENT_ORDER` + `EVENT_TRADE` 为主。
+- 持仓变化以 `EVENT_POSITION` 为主事实来源，避免仅靠本地成交推导造成漂移。
+
+### 3.2 委托状态语义（`Status`）
+
+| 状态 | 是否活动态 | 含义 |
+| --- | --- | --- |
+| `SUBMITTING` | 是 | 已发起下单，请求在柜台/网关受理中 |
+| `NOTTRADED` | 是 | 委托已被交易所接受，但尚未成交 |
+| `PARTTRADED` | 是 | 委托部分成交，剩余数量仍在挂单 |
+| `ALLTRADED` | 否 | 委托全部成交，进入终态 |
+| `CANCELLED` | 否 | 委托已撤销，进入终态 |
+| `REJECTED` | 否 | 委托被拒绝，进入终态 |
+
+执行扩展状态：
+
+- `cancel_pending_timeout`：撤单请求已发出且超过阈值仍未收到终态回报；该状态下继续阻断同品种新信号并触发对账/告警流程。
+
 ## 4. 服务边界
 
 ### 4.1 输入
@@ -75,7 +106,7 @@
 ### 4.2 输出
 
 - 交易网关：下单/撤单请求
-- PostgreSQL：`order_submit_rt`、`cancel_request_rt`、`trade_fill_rt`
+- PostgreSQL：`order_submit_rt`、`order_state_event_rt`、`cancel_request_rt`、`trade_fill_rt`、`position_snapshot_rt`
 - JetStream（可选）：`order.submit.<product_id>`、`order.cancel.<product_id>`、`order.event.<product_id>`、`trade.fill.<product_id>`
 - 查询接口：`position/active_orders/execution_watermark`
 
@@ -150,14 +181,17 @@ flowchart LR
 
 - 校验字段完整性：`event_id`、`cycle_id`、`decision_batch_no`、`expire_at`、`signal_action`
 - 校验时效：`now <= expire_at`
-- 校验动作枚举：`BUY/SELL`
+- 校验动作枚举：`BUY/SELL/HOLD`
 - 校验水位：丢弃落后于已执行批次的旧信号
+- 校验同品种活动委托闸门：若 `product_id` 下存在未终态委托则阻断 `BUY/SELL` 新信号
 
 规则：
 
 - 过期信号直接丢弃并记录告警
 - `decision_batch_no` 小于本地已应用水位时，判定为重复或过期批次
 - `event_id` 重复时幂等跳过
+- 当同一 `product_id` 存在活动委托时，`BUY/SELL` 只记录阻断日志，不触发新发单
+- `HOLD` 不受活动委托阻断，可正常通过并按 no-op 处理
 
 ### 6.3 Intent Mapper
 
@@ -165,16 +199,17 @@ flowchart LR
 
 - 将策略动作映射为执行意图
 - 输入：`signal_action + 当前持仓 + 风控限制`
-- 输出：目标方向与目标仓位（全仓）
+- 输出：目标方向与目标仓位（全仓）或 no-op
 
 映射规则（默认）：
 
 - `BUY`：目标仓位 = `+max_position_by_product[product_id]`
 - `SELL`：目标仓位 = `-max_position_by_product[product_id]`
+- `HOLD`：目标仓位 = `current_position`，不生成新委托
 
 说明：
 
-- 当前版本只处理全仓切换信号，不处理部分调仓信号
+- 当前版本只处理全仓切换信号，不处理部分调仓信号；`HOLD` 仅用于“保持不动”的显式状态传递
 
 ### 6.4 Order Planner
 
@@ -209,12 +244,14 @@ flowchart LR
 - 维护委托状态生命周期：`submitted -> accepted/partial_filled/filled/canceled/rejected`
 - 维护活动委托集合
 - 更新每个 `instrument_id` 的执行状态
+- 记录每次状态变化到 `order_state_event_rt`
 
 规则：
 
 - 活动委托定义：未到终态（`filled/canceled/rejected`）的委托
 - 同一 `cycle_id` 下重复信号不得导致重复新委托
-- 委托状态变化应写入执行事件日志（可选发布 `order.event.<product_id>`）
+- 同一 `product_id` 存在活动委托时，阻断该品种 `BUY/SELL` 新信号执行
+- 委托状态变化应写入 `order_state_event_*`，并可选发布 `order.event.<product_id>`
 
 ### 6.7 Timeout Cancel Manager
 
@@ -226,9 +263,11 @@ flowchart LR
 
 规则：
 
+- 撤单记录主事实表已存在：`cancel_request_rt` / `cancel_request_his`（数据库文档 4.5）
 - 撤单尝试逐次写入 `cancel_request_rt`（`attempt_no` 递增）
 - 达到 `cancel_retry_max` 后升级 `system.alert`
-- 若撤单请求长时间无回报，标记 `cancel_pending_timeout` 并阻断该 `instrument_id` 新开仓信号
+- 若撤单请求长时间无回报，标记 `cancel_pending_timeout` 并阻断该 `product_id` 新信号
+- 若最老活动委托持续时间超过 `active_order_stuck_alert_ms`，升级 `Critical` 告警并通知管理员
 - 进入人工/运维处置前，执行周期性状态对账（网关活动单 vs 本地活动单 vs 数据库状态）
 
 ### 6.8 Fill Handler
@@ -238,11 +277,13 @@ flowchart LR
 - 处理成交回报
 - 更新持仓快照、平均持仓价格与资金状态
 - 记录 `trade_fill_rt`
+- 监听持仓回报并写入 `position_snapshot_rt`
 
 要求：
 
 - 成交去重键：`account_id + trade_id`
 - 部分成交与多笔成交均按事实逐笔落库
+- 持仓写库以回报事实为准，不依赖仅成交推导
 
 ### 6.9 Decision Watermark Manager
 
@@ -281,12 +322,14 @@ flowchart LR
 职责：
 
 - 写入 `order_submit_rt` / `order_submit_his`
+- 写入 `order_state_event_rt` / `order_state_event_his`
 - 写入 `cancel_request_rt` / `cancel_request_his`
 - 写入 `trade_fill_rt` / `trade_fill_his`
+- 写入 `position_snapshot_rt` / `position_snapshot_his`
 
 字段口径：
 
-- 与 `docs/requirements/02_database_table_design.md` 的 4.4/4.5/4.6 保持一致
+- 与 `docs/requirements/02_database_table_design.md` 的 4.4/4.5/4.6/4.8/4.9 保持一致
 
 ### 6.12 Event Publisher（可选）
 
@@ -321,6 +364,11 @@ flowchart LR
   "signal_action": "BUY"
 }
 ```
+
+`signal_action` 说明：
+
+- `BUY/SELL`：进入委托计划与发单流程
+- `HOLD`：执行层 no-op，不发起新委托（仍参与幂等与水位推进）
 
 ### 7.2 `order.submit.<product_id>`（可选发布）
 
@@ -378,6 +426,12 @@ flowchart LR
 }
 ```
 
+### 7.5 决策信号落库说明
+
+- `strategy.signal.<product_id>` 的持久化由归档服务负责，落库表为 `strategy_signal_rt/his`（见数据库文档 4.7）。
+- 执行服务消费同一主题用于交易执行，不承担 `strategy_signal_*` 写入职责。
+- 当前版本 `HOLD` 先保证消息通道可观测，不强制落库；后续可扩展至数据库。
+
 ## 8. 关键时序
 
 ### 8.1 正常执行链路
@@ -397,10 +451,10 @@ sequenceDiagram
     OMS->>OMS: validate ttl + idempotency + watermark
     OMS->>RS: pre-trade risk check(optional)
     RS-->>OMS: pass/reject
-    OMS->>OMS: build order plan(BUY/SELL)
-    OMS->>EX: send order
+    OMS->>OMS: build order plan(BUY/SELL) or no-op(HOLD)
+    OMS->>EX: send order(only BUY/SELL)
     EX-->>OMS: order event / trade fill
-    OMS->>PG: write order_submit_rt / trade_fill_rt
+    OMS->>PG: write order_submit_rt / order_state_event_rt / trade_fill_rt / position_snapshot_rt
 ```
 
 ### 8.2 超时撤单链路
@@ -419,6 +473,43 @@ sequenceDiagram
     OMS->>OMS: retry if needed until cancel_retry_max
 ```
 
+### 8.3 委托-成交-撤单状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> SUBMITTING: send_order
+    SUBMITTING --> NOTTRADED: EVENT_ORDER(NOTTRADED)
+    SUBMITTING --> PARTTRADED: EVENT_ORDER(PARTTRADED)
+    SUBMITTING --> ALLTRADED: EVENT_ORDER(ALLTRADED)
+    SUBMITTING --> REJECTED: EVENT_ORDER(REJECTED)
+
+    NOTTRADED --> PARTTRADED: EVENT_TRADE/EVENT_ORDER
+    NOTTRADED --> ALLTRADED: EVENT_TRADE(full_fill)
+    PARTTRADED --> ALLTRADED: EVENT_TRADE(remain=0)
+
+    NOTTRADED --> CANCEL_PENDING: timeout -> cancel_order
+    PARTTRADED --> CANCEL_PENDING: timeout -> cancel_order
+    CANCEL_PENDING --> CANCELLED: EVENT_ORDER(CANCELLED)
+    CANCEL_PENDING --> ALLTRADED: fill_before_cancel_confirm
+    CANCEL_PENDING --> CANCEL_PENDING_TIMEOUT: no_response > cancel_pending_timeout_ms
+
+    CANCEL_PENDING_TIMEOUT --> CANCELLED: late_cancel_confirm
+    CANCEL_PENDING_TIMEOUT --> ALLTRADED: late_fill
+    CANCEL_PENDING_TIMEOUT --> ALERTING: age > active_order_stuck_alert_ms
+
+    ALLTRADED --> [*]
+    CANCELLED --> [*]
+    REJECTED --> [*]
+    ALERTING --> [*]
+```
+
+状态机约束：
+
+- `SUBMITTING/NOTTRADED/PARTTRADED/CANCEL_PENDING/CANCEL_PENDING_TIMEOUT` 均视为活动态。
+- 只要某 `product_id` 有活动态委托，执行服务就阻断该品种 `BUY/SELL` 新信号执行。
+- `HOLD` 不进入该委托状态机，按 no-op 路径处理。
+- `ALERTING` 代表已触发管理员告警，后续由人工处置或自动修复流程收敛到终态。
+
 ## 9. 一致性与恢复
 
 ### 9.1 幂等键
@@ -436,7 +527,6 @@ sequenceDiagram
 - 恢复后继续消费 `strategy.signal.*`
 
 ### 9.3 状态对账（占位）
-
 - 周期性对账：`OmsEngine` 状态 vs 数据库状态
 - 检测项：活动委托集合、持仓数量、最近批次水位
 - 发现不一致时触发修复流程并告警
@@ -471,8 +561,11 @@ sequenceDiagram
 | `account_id` | `sim_ctp_001` | 执行账户标识 | 分片主键 |
 | `gateway_name` | `CTP` | 网关名称 | 对应 `vnpy_ctp` |
 | `order_timeout_ms` | `3000` | 委托超时阈值 | 到时触发撤单 |
+| `product_signal_block_on_active_order` | `true` | 同品种有活动委托时是否阻断新信号 | 建议固定开启 |
+| `active_order_stuck_alert_ms` | `10000` | 活动委托持续未终态告警阈值 | 超过后通知管理员 |
 | `cancel_retry_max` | `3` | 最大撤单重试次数 | 超过则告警 |
 | `cancel_retry_backoff_ms` | `200` | 撤单重试退避时间 | - |
+| `cancel_pending_timeout_ms` | `2000` | 撤单请求后等待回报阈值 | 超过标记 `cancel_pending_timeout` |
 | `signal_ttl_strict` | `true` | 是否严格丢弃过期信号 | 建议开启 |
 | `risk_precheck_enabled` | `true` | 是否启用执行前风控校验 | 作为最后一道闸门 |
 | `max_position_by_product` | `{"rb":2,"al":2}` | 各品种最大仓位 | 参与订单计划 |
@@ -496,6 +589,8 @@ sequenceDiagram
 - `execution_order_reject_total`
 - `execution_timeout_cancel_total`
 - `execution_cancel_retry_total`
+- `execution_signal_blocked_by_active_order_total`
+- `execution_active_order_stuck_alert_total`
 - `execution_trade_fill_latency_ms_p95/p99`
 - `execution_active_order_count`
 - `execution_state_reconcile_mismatch_total`
@@ -510,16 +605,20 @@ sequenceDiagram
 ### 13.1 单元测试
 
 - 信号时效与幂等判定
-- `BUY/SELL` 到全仓目标计划映射
+- 同品种活动委托阻断规则
+- `BUY/SELL/HOLD` 动作路由与映射（`HOLD` no-op）
 - 无算法拆单约束下的单信号单计划生成逻辑
 - 超时撤单与重试策略
+- 活动委托超时告警阈值触发逻辑
 - 决策水位单调性校验
 
 ### 13.2 集成测试
 
 - 消费 `strategy.signal.<product_id>` 并完成下单
+- 消费 `HOLD` 信号并执行 no-op（不下单）
 - 委托回报、成交回报、部分成交场景
 - 超时撤单与多次撤单落库
+- 委托状态事件与持仓快照写库
 - 状态查询接口返回持仓/活动委托/水位正确
 
 ### 13.3 验收门槛
@@ -538,7 +637,7 @@ sequenceDiagram
 - 完成活动委托状态机、超时撤单和撤单重试
 
 3. 第三阶段：持久化与查询接口
-- 完成 `order_submit/cancel_request/trade_fill` 落库和查询 API
+- 完成 `order_submit/order_state_event/cancel_request/trade_fill/position_snapshot` 落库和查询 API
 
 4. 第四阶段：对账与告警
 - 完成水位对账、异常修复占位、监控告警闭环

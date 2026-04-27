@@ -133,6 +133,7 @@ flowchart LR
 - `risk_passed`
 
 只有全部满足，才允许进入策略运行阶段。
+若闸门不通过，策略模块应发布 `HOLD` 信号并附带阻断原因，保证消息序列连续可观测。
 
 ### 6.3 Strategy Runtime Adapter
 
@@ -154,6 +155,7 @@ flowchart LR
 - 生成统一信号对象
 - 计算 `generated_at`、`expire_at`、`cycle_id`、`decision_ts`、`decision_batch_no`
 - 将目标动作转换为执行层可理解的信号结构
+- `HOLD` 也必须生成并发布标准信号事件（用于时序对齐与审计）
 
 ### 6.5 Signal Publisher
 
@@ -187,7 +189,7 @@ flowchart LR
 ### 7.1 触发机制
 
 - 每次由因子模块完成一个 `factor_time_interval` 后立即触发一次策略计算
-- 若同一周期已存在未终态委托，则直接跳过
+- 若同一周期已存在未终态委托，则发布 `HOLD`（`reason=active_orders`）
 - 策略模块不再单独消费 `md.tick.raw.<product_id>` 或 `factor.unit.calculated.<product_id>`
 - 若因子模块处于“合约切换预热期”，则强制跳过策略触发
 
@@ -275,7 +277,23 @@ flowchart LR
 - `SelectionAgent` 输入 `selection_state_vector` 对齐 `ArchetypeTrader/src/phase2/selection_agent.py`
 - `PolicyAdapter` 依赖 `a_base/a_base_prev/has_adjusted` 对齐 `ArchetypeTrader/src/phase3/policy_adapter.py`
 
-### 8.2 `strategy.signal.<product_id>`
+### 8.2 决策输入详细审查（待专项评审）
+
+`FactorDecisionContext` 已满足当前联调，但仍需专项评审并冻结最终输入契约。以下项在当前版本标记为“必审”：
+
+- 外部状态时效：`position_ts`、`active_order_ts`、`risk_check_ts` 的新鲜度阈值与优先级
+- 资金与风险约束：是否补充 `available_cash`、`margin_ratio`、`risk_limit_version` 等字段
+- 订单约束输入：是否补充“同品种活动委托阻断状态”和“撤单超时状态”字段
+- 合约切换语义：`contract_switch_phase` 与预热完成判定在策略入模前的阻断边界
+- 向量一致性：`market_state_schema` 与模型训练版 schema 的强一致校验策略
+- 版本治理：`strategy_version`、`market_state_schema_version`、`context_schema_version` 的兼容矩阵
+
+落地约束：
+
+- 在专项评审完成前，新增输入字段必须向后兼容，不允许删除既有核心字段。
+- 所有输入变更必须同步更新策略回放样本与集成测试基线。
+
+### 8.3 `strategy.signal.<product_id>`
 
 ```json
 {
@@ -302,12 +320,12 @@ flowchart LR
 
 - `BUY`：买入
 - `SELL`：卖出
-- `HOLD`：保持不动
+- `HOLD`：保持不动（不发起新委托）
 
 消费方：
 
-- 执行服务消费 `strategy.signal.*` 并执行下单/撤单流程
-- 归档服务消费 `strategy.signal.*` 并做信号落库归档
+- 执行服务消费 `strategy.signal.*`；`BUY/SELL` 进入下单流程，`HOLD` 按 no-op 处理
+- 归档服务消费 `strategy.signal.*` 并做信号归档（当前优先落库 `BUY/SELL`，`HOLD` 后续扩展）
 
 ## 9. 关键时序
 
@@ -430,6 +448,7 @@ sequenceDiagram
 ### 14.2 集成测试
 
 - 接收因子模块回调并生成 `strategy.signal.<product_id>`
+- `HOLD` 信号发布与幂等校验（不触发交易）
 - 无活动委托/有活动委托两类周期行为验证
 - 风控阻断与持仓过旧场景验证
 - 执行服务与归档服务并行消费 `strategy.signal.*` 验证

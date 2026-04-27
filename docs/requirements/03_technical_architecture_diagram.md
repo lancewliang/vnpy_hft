@@ -108,14 +108,14 @@ sequenceDiagram
     AS->>PG: 写入 factor_unit(1行=x秒)
 
     SE->>OMS: 同步查询持仓与活动委托状态
-    SE->>MQ: 发布 strategy.signal(含 expire_at)
+    SE->>MQ: 发布 strategy.signal.<product_id>(BUY/SELL/HOLD, 含 expire_at)
 
     MQ->>RS: 事前风控检查
     RS->>MQ: 发布 risk.alert 或放行
 
     MQ->>OMS: 接收下单/撤单指令
     OMS->>EX: 委托/撤单
-    OMS->>PG: 写入 order_submit/cancel_request/trade_fill
+    OMS->>PG: 写入 order_submit/order_state_event/cancel_request/trade_fill/position_snapshot
     OMS->>RD: 更新活动委托状态
 ```
 
@@ -171,6 +171,9 @@ sequenceDiagram
 - 行情采集职责：只接收并发布 `md.tick.raw.<product_id>`，不直接落库。
 - 行情采集轻量化：不做标准化、窗口聚合和数据库写入。
 - 归档职责：独立消费 `md.tick.raw.*`、`md.tick.merged.*` 与 `factor.unit.calculated.*` 并写入 PostgreSQL。
+- 决策信号归档：归档服务消费 `strategy.signal.<product_id>` 并写入 `strategy_signal_*`。
+- 执行写库职责：执行服务直接写入 `order_submit_*`、`order_state_event_*`、`cancel_request_*`、`trade_fill_*`、`position_snapshot_*`。
+- `HOLD` 信号也会发布到 `strategy.signal.<product_id>`；执行服务按 no-op 处理，数据库落库后续扩展。
 - 时间区间闭合：由因子模块维护；策略模块通过进程内调用直接复用闭合结果。
 - 分片扩展：决策流水线必须按 `product_id` 分配实例，不同品种不得在同一计算实例内混跑。
 - 部署示例：`AL` 启动 `decision-pipeline-AL`，`FU` 启动 `decision-pipeline-FU`，分别订阅 `md.tick.raw.AL`、`md.tick.raw.FU`。

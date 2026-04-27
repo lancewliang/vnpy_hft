@@ -138,17 +138,21 @@
 - 由因子模块在 `factor_time_interval` 闭合后通过内存直接调用
 - 判定前检查闸门：无活动委托、持仓快照版本有效、行情新鲜、风控通过
 - 直接读取因子模块内存中的最近 `400` 行因子缓存，不通过消息通道或 Redis 获取因子
-- 输出策略信号（含 `generated_at`、`expire_at`、`cycle_id`）
+- 输出策略信号（`strategy.signal.<product_id>`，含 `generated_at`、`expire_at`、`cycle_id`）
+- 信号动作支持 `BUY/SELL/HOLD`；`HOLD` 也必须发布到消息主题
 
 ### 5.5 执行服务（OMS/Execution）
 
 - 代码来源：以 `vnpy` 交易执行与委托回报机制为底座，在 `vnpy_hft` 中增强超时与状态管理
 - 接收策略信号并校验有效期
 - 发出委托指令（经 `vnpy_ctp`）
+- 同一 `product_id` 存在未终态委托时阻断 `BUY/SELL` 新信号执行
+- `HOLD` 信号按 no-op 处理，不触发新委托
 - 记录下单事件
 - 管理超时撤单
 - 记录多次撤单尝试
-- 记录成交明细
+- 记录委托状态变化、成交明细与持仓状态变化
+- 活动委托持续超阈值未终态时触发管理员告警
 
 ### 5.6 风控服务（Risk Service）
 
@@ -191,11 +195,11 @@
 - `md.tick.merged.<product_id>`：按 `factor_time_interval` 合并后的原始行（按品种分片）
 - `md.tick.archived`：行情归档写库完成事件
 - `factor.unit.calculated.<product_id>`：因子结果归档事件
-- `strategy.signal`：策略信号
-- `order.submit`：下单请求
-- `order.cancel`：撤单请求
-- `order.event`：委托回报
-- `trade.fill`：成交回报
+- `strategy.signal.<product_id>`：策略信号（`BUY/SELL/HOLD`，执行服务与归档服务共同消费）
+- `order.submit.<product_id>`：下单请求
+- `order.cancel.<product_id>`：撤单请求
+- `order.event.<product_id>`：委托回报
+- `trade.fill.<product_id>`：成交回报
 - `risk.alert`：风险告警
 - `system.alert`：系统告警
 - `settlement.contract.synced`：外部结算接口同步完成
@@ -220,6 +224,7 @@
 
 - 每次策略运行分配唯一 `cycle_id`
 - 当前周期存在未终态委托时，不进入下一周期
+- 若因闸门阻断而不进入交易执行，仍发布 `HOLD` 信号到 `strategy.signal.<product_id>`
 - “终态”定义为：已成交完成或已撤单完成
 
 ### 7.2 信号时效控制
@@ -233,6 +238,8 @@
 - 委托单配置 `timeout_ms`
 - 超时后自动发起撤单
 - 多次撤单均记录（不覆盖历史）
+- 同一品种存在未终态委托时阻断 `BUY/SELL` 新信号执行
+- 未终态持续超过 `active_order_stuck_alert_ms` 时告警升级到管理员
 
 ### 7.4 持仓参与策略
 
@@ -271,8 +278,9 @@
 
 - 保存全量数据
 - 逻辑上 append-only（只插入，不更新）
-- 行情数据与因子数据由归档服务写入；决策流水线不直接写 PostgreSQL；交易与结算数据由对应业务服务写入
+- 行情数据与因子数据由归档服务写入；归档服务同时写入决策信号表 `strategy_signal_*`（当前优先落库 `BUY/SELL`，`HOLD` 后续扩展）；交易与结算数据由对应业务服务写入
 - `merged_tick_l2_*` 作为合并原始行事实表，由归档服务消费 `md.tick.merged.*` 写入
+- 执行服务直接写入交易执行主事实：`order_submit_*`、`order_state_event_*`、`cancel_request_*`、`trade_fill_*`、`position_snapshot_*`
 - 采用 PostgreSQL 声明式分区（逻辑仍是一张表）
 
 ### 8.2 Redis（实时态）
@@ -309,6 +317,8 @@
 - 撤单成功率
 - 拒单率
 - 超时撤单触发次数
+- 同品种信号阻断次数
+- 活动委托超时未终态告警次数
 
 ### 10.3 系统健康
 
