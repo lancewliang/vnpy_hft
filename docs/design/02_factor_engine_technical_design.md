@@ -226,9 +226,10 @@ flowchart LR
 
 职责：
 
-- 在因子结果完成后组装 `FactorDecisionContext`
-- 通过进程内函数调用直接触发策略模块计算
-- 传递完整决策输入结构：市场状态向量、archetype 上下文、窗口元数据与外部状态占位（不包含 `factor_cache` 快照）
+- 在每次因子结果完成后，向 `horizon_state_buffer` 追加 `1` 行状态
+- 当 `horizon_state_buffer` 凑满 `strategy_horizon_size(h)` 时组装 `FactorDecisionContext`
+- 通过进程内函数调用触发策略模块 `evaluate_pair_a_horizon`
+- 传递决策输入结构：`horizon_states`、窗口元数据与外部状态占位（不包含推断内部状态与 `factor_cache` 快照）
 
 ### 6.8 Archive Event Publisher
 
@@ -455,7 +456,8 @@ sequenceDiagram
     FE->>FE: mark closed-window raw ticks as factor_calculated=true
     FE->>FE: evict all raw ticks in the closed window as a batch
     FE->>FE: update in-memory factor cache(last 400 rows)
-    FE->>SE: invoke strategy in-process
+    FE->>FE: append horizon_state_buffer(+1 row)
+    FE->>SE: invoke strategy in-process(only when horizon buffer is full)
     FE->>MQ: publish factor.unit.calculated.<product_id>
     MQ->>AS: consume factor.unit.calculated.*
     AS->>PG: idempotent write factor_unit

@@ -5,11 +5,11 @@
 定义 `vnpy_hft` 策略模块的可实现技术方案，覆盖：
 
 - 通过进程内接口接收因子模块回调
-- 消费由因子模块组装的 `FactorDecisionContext`（包含 `ArchetypeTrader` 决策输入所需字段）
+- 消费由因子模块组装的 `FactorDecisionContext`（仅包含 horizon 级输入与外部状态）
 - 接入 `ArchetypeTrader` 决策逻辑
 - 执行前置闸门校验并输出交易信号
 - 支撑按 `product_id` 的同进程部署、状态恢复与信号时效控制
-- 策略触发节奏完全跟随因子模块的 `factor_time_interval`
+- 策略触发由因子模块按 `factor_time_interval` 逐步累积 `horizon_states`，凑满一个 horizon 后调用 `evaluate_pair_a_horizon`
 
 本设计中的策略模块是 `Decision Pipeline` 的一部分，和因子模块同进程部署。
 
@@ -26,7 +26,7 @@
 
 - 接收因子模块的进程内回调
 - 管理策略运行上下文：持仓、活动委托状态、行情新鲜度、风控放行状态
-- 读取并校验 `FactorDecisionContext` 的完整性（市场状态 + archetype 上下文 + 外部状态）
+- 读取并校验 `FactorDecisionContext` 的完整性（horizon 状态序列 + 外部状态）
 - 在满足闸门条件时运行策略逻辑
 - 发布 `strategy.signal.<product_id>`
 
@@ -40,7 +40,7 @@
 
 ### 2.3 相关模块职责
 
-- 因子模块：计算因子并组装 `FactorDecisionContext`，通过内存直接调用策略模块
+- 因子模块：计算因子并累积 `horizon_states`，凑满后组装 `FactorDecisionContext` 并通过内存调用策略模块
 - 归档服务：消费 `strategy.signal.*` 做信号归档，并消费 `factor.unit.calculated.*` 写入 `factor_unit_*`
 - 执行服务：消费 `strategy.signal.*` 并发单
 - 风控服务：给出事前风控结论
@@ -112,7 +112,7 @@ flowchart LR
 职责：
 
 - 接收因子模块传入的 `FactorDecisionContext`
-- `FactorDecisionContext` 基础字段由因子服务（特征服务）组装并传入
+- `FactorDecisionContext` 基础字段由因子服务（特征服务）在 horizon 凑满时组装并传入
 - 在进入模型前补齐 `external_state`（持仓/活动委托/风控）字段
 - 作为策略计算的唯一触发入口
 
@@ -140,7 +140,8 @@ flowchart LR
 职责：
 
 - 对接 `ArchetypeTrader` 中迁移后的在线推断逻辑
-- 将完整 `FactorDecisionContext` 作为模型唯一输入（含 `s_ref1`、`s_ref2` 与外部状态）
+- 当 `FactorDecisionContext.horizon_states` 凑满后，调用 `evaluate_pair_a_horizon` 执行推断
+- `s_ref1`、`s_ref2`、`a_base_prev`、`tau_remain` 等仅作为推断过程内部变量，不进入跨模块上下文
 - 输出交易动作信号（`BUY/SELL/HOLD`）
 
 要求：
@@ -188,7 +189,9 @@ flowchart LR
 
 ### 7.1 触发机制
 
-- 每次由因子模块完成一个 `factor_time_interval` 后立即触发一次策略计算
+- 每次因子模块完成一个 `factor_time_interval`，先向 `horizon_state_buffer` 追加 `1` 行状态
+- 当 `horizon_state_buffer` 行数达到 `horizon_size(h)` 时，组装 `FactorDecisionContext` 并调用 `evaluate_pair_a_horizon`
+- `horizon` 采用滚动窗口（默认步长 `1` 行），每次决策后弹出最旧状态继续累积
 - 若同一周期已存在未终态委托，则发布 `HOLD`（`reason=active_orders`）
 - 策略模块不再单独消费 `md.tick.raw.<product_id>` 或 `factor.unit.calculated.<product_id>`
 - 若因子模块处于“合约切换预热期”，则强制跳过策略触发
@@ -197,7 +200,7 @@ flowchart LR
 
 - 每次策略运行分配唯一 `cycle_id`
 - 每次策略运行生成单调递增 `decision_batch_no`
-- 相同 `instrument_id + factor_time_interval + unit_end_ts + strategy_id` 只允许产出一组有效信号
+- 相同 `instrument_id + horizon_start_ts + horizon_end_ts + strategy_id` 只允许产出一组有效信号
 - 若因重试重复进入，需利用 `cycle_id + decision_batch_no` 做信号去重
 
 ### 7.3 信号时效
@@ -233,9 +236,10 @@ flowchart LR
 
 `FactorDecisionContext` 是策略入模前的统一输入载体：
 
-- 基础字段由因子服务（特征服务）在区间闭合后生成
+- 基础字段由因子服务（特征服务）在 `horizon_states` 凑满后生成
 - 外部状态字段由策略入口在同周期补齐（持仓/活动委托/风控）
 - 不再在该结构中放入 `factor_cache` 快照字段
+- 不承载推断过程内部变量（如 `a_base_prev`、`tau_remain`、`R_arche`）
 
 字段定义：
 
@@ -247,22 +251,11 @@ flowchart LR
 | `vt_symbol` | `string` | `instrument_id.exchange` |
 | `trading_day` | `date` | 交易日 |
 | `factor_time_interval` | `string` | 因子时间区间（如 `20s`） |
-| `unit_start_ts` | `timestamptz` | 本次区间起始时间 |
-| `unit_end_ts` | `timestamptz` | 本次区间结束时间 |
-| `market_state_vector` | `list<float>` | `s_ref1`：当前步市场状态向量（ArchetypeTrader 输入） |
-| `market_state_schema` | `list<string>` | `market_state_vector` 字段顺序定义，保证训练/推理一致 |
-| `selection_state_vector` | `list<float>` | horizon 起点状态（用于 SelectionAgent 选 archetype） |
-| `archetype_index` | `int` | `a_sel`：SelectionAgent 选择的 archetype 索引 |
-| `archetype_embedding` | `list<float>` | `e_a_sel`：codebook embedding 向量 |
-| `base_action_current` | `int` | `a_base`：当前步 base action（取值 `0/1/2`） |
-| `base_action_prev` | `int` | `a_base_prev`：上一步 base action（PolicyAdapter 输入） |
-| `cumulative_reward_raw` | `float` | `R_arche`：当前 horizon 累积收益（原始值） |
-| `notional_base` | `float` | 归一化分母 `m * p0` |
-| `normalized_reward` | `float` | `R_arche / notional_base`（Refinement 上下文输入） |
-| `horizon_steps` | `int` | `h`：当前 horizon 总步数 |
-| `step_idx_in_horizon` | `int` | 当前步索引 `step_idx` |
-| `tau_remain` | `float` | `(h - step_idx) / h`（Refinement 上下文输入） |
-| `has_adjusted_in_horizon` | `bool` | 当前 horizon 是否已执行一次非零调整 |
+| `horizon_start_ts` | `timestamptz` | 本次 horizon 起始时间 |
+| `horizon_end_ts` | `timestamptz` | 本次 horizon 结束时间 |
+| `horizon_states` | `list<list<float>>` | 传给 `evaluate_pair_a_horizon` 的完整状态序列（长度=`h`） |
+| `horizon_state_schema` | `list<string>` | `horizon_states` 列顺序定义，保证训练/推理一致 |
+| `horizon_unit_end_ts_list` | `list<timestamptz>` | 每个状态行对应的 `factor_time_interval` 区间结束时间 |
 | `external_state.position_snapshot` | `object` | 持仓快照（`position_qty`、`position_ts`、`avg_hold_price`、`cash`、`total_value`） |
 | `external_state.active_order_snapshot` | `object` | 活动委托快照（`has_active_orders`、`active_order_count`、`active_order_ts`、`order_state_version`） |
 | `external_state.risk_snapshot` | `object` | 风控快照（`risk_passed`、`risk_check_ts`、`risk_version`、`reject_reason`） |
@@ -273,11 +266,23 @@ flowchart LR
 
 字段来源对齐说明：
 
-- `s_ref1` 与 `s_ref2=[e_a_sel, a_base, normalized_reward, tau_remain]` 对齐 `ArchetypeTrader/src/evaluation/inference_runner.py`
-- `SelectionAgent` 输入 `selection_state_vector` 对齐 `ArchetypeTrader/src/phase2/selection_agent.py`
-- `PolicyAdapter` 依赖 `a_base/a_base_prev/has_adjusted` 对齐 `ArchetypeTrader/src/phase3/policy_adapter.py`
+- `horizon_states` 对齐 `ArchetypeTrader/src/evaluation/inference_runner.py` 中 `evaluate_pair_a_horizon(horizon_states, ...)` 的输入契约
+- `horizon_states[0]` 在推断内部用于 SelectionAgent 选 archetype（不在上下文中显式放 `selection_state_vector`）
+- `s_ref1`、`s_ref2`、`a_base_prev`、`normalized_reward`、`tau_remain`、`has_adjusted_in_horizon` 均在 `evaluate_pair_a_horizon/run_horizon_inference` 内部计算
 
-### 8.2 决策输入详细审查（待专项评审）
+### 8.2 `InferenceRuntimeState`（内部运行态，不进入 `FactorDecisionContext`）
+
+以下字段属于策略推断过程内部状态，不作为跨模块传输字段：
+
+- `market_state_vector`（`s_ref1`）
+- `selection_state_vector`
+- `archetype_index`、`archetype_embedding`
+- `base_action_current`、`base_action_prev`
+- `cumulative_reward_raw`、`notional_base`、`normalized_reward`
+- `horizon_steps`、`step_idx_in_horizon`、`tau_remain`
+- `has_adjusted_in_horizon`
+
+### 8.3 决策输入详细审查（待专项评审）
 
 `FactorDecisionContext` 已满足当前联调，但仍需专项评审并冻结最终输入契约。以下项在当前版本标记为“必审”：
 
@@ -285,15 +290,15 @@ flowchart LR
 - 资金与风险约束：是否补充 `available_cash`、`margin_ratio`、`risk_limit_version` 等字段
 - 订单约束输入：是否补充“同品种活动委托阻断状态”和“撤单超时状态”字段
 - 合约切换语义：`contract_switch_phase` 与预热完成判定在策略入模前的阻断边界
-- 向量一致性：`market_state_schema` 与模型训练版 schema 的强一致校验策略
-- 版本治理：`strategy_version`、`market_state_schema_version`、`context_schema_version` 的兼容矩阵
+- 向量一致性：`horizon_state_schema` 与模型训练版 schema 的强一致校验策略
+- 版本治理：`strategy_version`、`horizon_state_schema_version`、`context_schema_version` 的兼容矩阵
 
 落地约束：
 
 - 在专项评审完成前，新增输入字段必须向后兼容，不允许删除既有核心字段。
 - 所有输入变更必须同步更新策略回放样本与集成测试基线。
 
-### 8.3 `strategy.signal.<product_id>`
+### 8.4 `strategy.signal.<product_id>`
 
 ```json
 {
@@ -308,7 +313,7 @@ flowchart LR
   "instrument_id": "rb2610",
   "trading_day": "2026-04-26",
   "factor_time_interval": "20s",
-  "unit_end_ts": "2026-04-26T09:30:20+08:00",
+  "horizon_end_ts": "2026-04-26T09:30:20+08:00",
   "generated_at": "2026-04-26T09:30:20.120+08:00",
   "expire_at": "2026-04-26T09:30:20.620+08:00",
   "signal_action": "BUY",
@@ -341,7 +346,7 @@ sequenceDiagram
 
     FE->>SE: run_strategy(context)
     SE->>QA: query positions/active orders/risk state
-    SE->>SE: fill context.external_state + gate check + run strategy
+    SE->>SE: fill context.external_state + gate check + evaluate_pair_a_horizon
     SE->>MQ: publish strategy.signal.<product_id>
     MQ-->>OMS: consume strategy.signal.*
     MQ-->>AS: consume strategy.signal.*
@@ -352,7 +357,7 @@ sequenceDiagram
 ### 10.1 幂等
 
 - 事件幂等键：`event_id`
-- 决策幂等键：`strategy_id + instrument_id + factor_time_interval + unit_end_ts + cycle_id + decision_batch_no`
+- 决策幂等键：`strategy_id + instrument_id + horizon_start_ts + horizon_end_ts + cycle_id + decision_batch_no`
 
 ### 10.2 重启恢复
 
@@ -409,12 +414,14 @@ sequenceDiagram
 | `strategy_signal_subject_pattern` | `strategy.signal.{product_id}` | 信号发布主题模板 | 执行与归档均消费该主题 |
 | `strategy_id` | `archetype_v1` | 策略标识 | - |
 | `strategy_version` | `v1` | 策略版本 | - |
+| `strategy_horizon_size` | `72`（示例） | `evaluate_pair_a_horizon` 需要的 `h` | 必须与训练配置一致 |
 | `max_cycle_retry` | `3` | 单周期最大重试次数 | - |
 | `strategy_wait_factor_warmup` | `true` | 是否等待因子预热完成后再触发策略 | - |
 
 说明：
 
 - `factor_time_interval` 由因子服务统一配置并随回调上下文传入，策略服务不再重复配置。
+- `strategy_horizon_size` 为策略模型契约，因子侧必须按该值凑满 `horizon_states` 后再触发决策。
 - `factor_cache_rows` 仅用于预热达标判断；`FactorDecisionContext` 不包含因子缓存快照。
 
 ## 13. 可观测性与告警
@@ -440,6 +447,7 @@ sequenceDiagram
 ### 14.1 单元测试
 
 - 因子模块回调与 `FactorDecisionContext` 字段完整性校验逻辑
+- `horizon_states` 累积与凑满触发逻辑（仅凑满后调用 `evaluate_pair_a_horizon`）
 - 闸门规则正确性
 - 信号时效字段生成正确性
 - `signal_action` 枚举值（`BUY/SELL/HOLD`）合法性

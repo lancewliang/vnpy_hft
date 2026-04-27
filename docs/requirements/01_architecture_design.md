@@ -49,8 +49,8 @@
 - 目标交易所：上海期货交易所（SHFE）、中国金融期货交易所（CFFEX）
 - 关键交易接口：`vnpy_ctp`
 - 交易日定义：`T日 = T-1 夜盘 + T日上午 + T日下午`
-- 决策触发：每次 `factor_time_interval` 完成后由因子模块直接调用策略模块
-- 决策频率：仅在“因子时间区间完成”时触发（`factor_time_interval` 可配置，如 `20s`、`30s`）
+- 决策触发：每次 `factor_time_interval` 完成后先累积 `horizon_states`，凑满一个 horizon 后由因子模块调用策略模块
+- 决策频率：基础步进为 `factor_time_interval`，实际发出决策信号频率受 `horizon_size` 与滚动步长约束
 - 因子计算口径：因子由单个 `factor_time_interval` 区间内全部原始五档行情行聚合计算，因子表 `1` 行代表一个 `factor_time_interval` 结果
 - 因子与策略内存窗口：运行期原始行情缓存仅保留未闭合区间数据；重启回看窗口固定 `5` 分钟（`raw_market_cache_seconds=300`）；决策流水线内存固定保留最近 `400` 行因子结果
 - 缓存来源约束：重启场景下因子模块必须从数据库同时加载原始行情缓存与因子缓存；非重启场景下原始行情缓存由消费 topic 流实时构建，因子缓存由在线计算结果持续滚动保留
@@ -59,7 +59,7 @@
 - 行情服务职责边界：仅负责行情接收与消息发布，不负责标准化、窗口聚合和数据库落库
 - 行情主题约束：原始行情发布主题采用 `md.tick.raw.<product_id>`（如 `md.tick.raw.rb`、`md.tick.raw.IF`）
 - 行情与因子落库职责：由独立归档服务分别消费 `md.tick.raw.*`、`md.tick.merged.*` 与 `factor.unit.calculated.<product_id>` 后写入 PostgreSQL
-- 时间区间职责：`factor_time_interval` 闭合由因子模块维护并触发，策略模块通过进程内调用直接复用闭合结果
+- 时间区间职责：`factor_time_interval` 闭合由因子模块维护并触发；策略模块通过进程内调用复用“凑满 horizon 后”的状态序列
 - 前置约束：必须满足“当前委托已结束（成交/撤单）+ 持仓新鲜 + 行情新鲜 + 风控通过”后，才允许新一轮策略
 - 信号时效：策略结果带有效期，过期不得下发到执行层
 - 超时委托：需定义超时时间，触发自动撤单
@@ -129,13 +129,13 @@
 - 由因子服务自身维护 `factor_time_interval` 闭合，并在区间完成时计算因子
 - 对外发布 `md.tick.merged.<product_id>`（合并后的原始行）供归档服务落库
 - 对外发布 `factor.unit.calculated.<product_id>` 供归档服务落库
-- 对内通过进程内内存调用直接触发策略模块计算
+- 对内先累积 `horizon_states`，凑满后再通过进程内内存调用触发策略模块计算
 
 ### 5.4 策略服务（Strategy Engine）
 
 - 代码来源：主要移植 `ArchetypeTrader` 策略决策代码，并适配实盘调度与风控闸门
 - 物理部署：与因子模块按 `product_id` 同进程部署，组成 `Decision Pipeline`
-- 由因子模块在 `factor_time_interval` 闭合后通过内存直接调用
+- 由因子模块在 `horizon_states` 凑满后通过内存直接调用
 - 判定前检查闸门：无活动委托、持仓快照版本有效、行情新鲜、风控通过
 - 直接读取因子模块内存中的最近 `400` 行因子缓存，不通过消息通道或 Redis 获取因子
 - 输出策略信号（`strategy.signal.<product_id>`，含 `generated_at`、`expire_at`、`cycle_id`）
@@ -297,7 +297,7 @@
 ## 9. 性能目标（防过度设计）
 
 - 调度频率：每秒一次触发检查
-- 决策触发：`factor_time_interval` 完成后执行
+- 决策触发：`horizon_states` 凑满后执行（底层步进仍为 `factor_time_interval`）
 - 时延目标：因子区间就绪到下单请求产出 `p99 <= 500ms`
 - 执行目标：下单请求到交易接口回执 `p99 <= 1s`
 - 稳定性目标：交易时段可用性 `>= 99.9%`

@@ -102,7 +102,8 @@ sequenceDiagram
     FE->>FE: Factor Calculator 基于 feature_calculator 产出因子行
     FE->>FE: 标记闭合区间 raw tick 为 factor_calculated=true 并整窗淘汰
     FE->>FE: 更新最近 400 行因子内存缓存
-    FE->>SE: 进程内直接调用策略计算
+    FE->>FE: 累积 horizon_states(每闭合区间 +1 行)
+    FE->>SE: horizon_states 凑满后进程内调用 evaluate_pair_a_horizon
     FE->>MQ: 发布 factor.unit.calculated.<product_id>
     MQ->>AS: 消费 factor.unit.calculated.*
     AS->>PG: 写入 factor_unit(1行=x秒)
